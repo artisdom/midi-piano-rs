@@ -7,7 +7,7 @@ use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{
     Column, button, column, container, pick_list, row, scrollable, text, text_input,
 };
-use iced::{Color, Element, Length, Subscription, Task, Theme, application, executor, time};
+use iced::{Color, Element, Font, Length, Subscription, Task, Theme, application, executor, time};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use uuid::Uuid;
@@ -19,6 +19,9 @@ use crate::midi::{MidiLibrary, MidiPlayer, MidiSequence, PlayerEvent, SharedMidi
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
 
 type AsyncResult<T> = Result<T, String>;
+
+const NOTO_SANS_SC: &[u8] = include_bytes!("../assets/fonts/NotoSansSC-Regular.otf");
+const DEFAULT_FONT: Font = Font::with_name("Noto Sans SC");
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -562,6 +565,8 @@ pub fn run() -> iced::Result {
     application("MIDI Piano Player", update, view)
         .subscription(subscription)
         .theme(theme)
+        .font(NOTO_SANS_SC)
+        .default_font(DEFAULT_FONT)
         .executor::<executor::Default>()
         .run_with(MidiPianoApp::init)
 }
