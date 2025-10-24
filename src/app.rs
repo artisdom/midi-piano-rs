@@ -1012,7 +1012,7 @@ impl MidiPianoApp {
             } else {
                 "Favorites"
             };
-            let mut button = button(label);
+            let mut button = button(text(label).shaping(Shaping::Advanced));
             if self.show_favorites_only {
                 button = button.style(iced::widget::button::success);
             } else {
@@ -1041,7 +1041,7 @@ impl MidiPianoApp {
     }
 
     fn playback_controls(&self) -> Element<'_, Message> {
-        let prev_button = button("⏮")
+        let prev_button = button(text("⏮").shaping(Shaping::Advanced))
             .on_press(Message::PrevTrack)
             .style(iced::widget::button::secondary);
 
@@ -1053,7 +1053,7 @@ impl MidiPianoApp {
             .on_press(Message::StopPressed)
             .style(iced::widget::button::secondary);
 
-        let next_button = button("⏭")
+        let next_button = button(text("⏭").shaping(Shaping::Advanced))
             .on_press(Message::NextTrack)
             .style(iced::widget::button::secondary);
 
