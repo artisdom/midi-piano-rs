@@ -7,18 +7,61 @@ use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{
     Column, button, column, container, pick_list, row, scrollable, text, text_input,
 };
-use iced::{Application, Color, Command, Element, Length, Subscription, Theme, executor, time};
+use iced::{Color, Element, Length, Subscription, Task, Theme, application, executor, time};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use uuid::Uuid;
 
 use crate::devices::{MidiDeviceDescriptor, MidiDeviceManager};
 use crate::midi::sink::MidiTransport;
-use crate::midi::{MidiEntry, MidiLibrary, MidiPlayer, MidiSequence, PlayerEvent, SharedMidiSink};
+use crate::midi::{MidiLibrary, MidiPlayer, MidiSequence, PlayerEvent, SharedMidiSink};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
 
-type AsyncResult<T> = std::result::Result<T, String>;
+type AsyncResult<T> = Result<T, String>;
+
+#[derive(Debug, Clone)]
+enum Message {
+    LibraryLoaded(AsyncResult<MidiLibrary>),
+    DevicesRefreshed(AsyncResult<Vec<MidiDeviceDescriptor>>),
+    DeviceSelected(Uuid),
+    SongSelected(Uuid),
+    SearchChanged(String),
+    PlayPressed,
+    StopPressed,
+    AddLocalFile,
+    PlaybackPrepared(AsyncResult<PreparedPlayback>),
+    RefreshDevices,
+    Tick,
+    DismissStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeviceChoice {
+    id: Uuid,
+    name: String,
+    transport: MidiTransport,
+}
+
+impl DeviceChoice {
+    fn from(descriptor: &MidiDeviceDescriptor) -> Self {
+        Self {
+            id: descriptor.info.id,
+            name: descriptor.info.name.clone(),
+            transport: descriptor.info.transport,
+        }
+    }
+}
+
+impl fmt::Display for DeviceChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let transport = match self.transport {
+            MidiTransport::Usb => "USB",
+            MidiTransport::Bluetooth => "BLE",
+        };
+        write!(f, "[{transport}] {}", self.name)
+    }
+}
 
 pub struct MidiPianoApp {
     library: MidiLibrary,
@@ -39,7 +82,7 @@ pub struct MidiPianoApp {
 }
 
 impl MidiPianoApp {
-    fn new_state() -> (Self, Command<Message>) {
+    fn init() -> (Self, Task<Message>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let device_manager = Arc::new(Mutex::new(MidiDeviceManager::new()));
 
@@ -61,12 +104,199 @@ impl MidiPianoApp {
             is_preparing_playback: false,
         };
 
-        let initial_command = Command::batch(vec![
-            Command::perform(load_library(), Message::LibraryLoaded),
-            Command::perform(refresh_devices(device_manager), Message::DevicesRefreshed),
+        let task = Task::batch([
+            Task::perform(load_library(), Message::LibraryLoaded),
+            Task::perform(refresh_devices(device_manager), Message::DevicesRefreshed),
         ]);
 
-        (app, initial_command)
+        (app, task)
+    }
+
+    fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::LibraryLoaded(result) => {
+                match result {
+                    Ok(library) => {
+                        self.library = library;
+                        self.status_message = Some("Library loaded".into());
+                    }
+                    Err(err) => {
+                        self.error_message = Some(format!("Failed to load MIDI library: {err}"));
+                    }
+                }
+                Task::none()
+            }
+            Message::DevicesRefreshed(result) => {
+                self.is_scanning_devices = false;
+                match result {
+                    Ok(descriptors) => {
+                        self.devices = descriptors.iter().map(DeviceChoice::from).collect();
+                        if let Some(selected) = self.selected_device {
+                            if !self.devices.iter().any(|choice| choice.id == selected) {
+                                self.selected_device = None;
+                            }
+                        }
+                        self.status_message = Some("Devices updated".into());
+                    }
+                    Err(err) => {
+                        self.error_message = Some(format!("Failed to refresh devices: {err}"));
+                    }
+                }
+                Task::none()
+            }
+            Message::RefreshDevices => {
+                self.is_scanning_devices = true;
+                Task::perform(
+                    refresh_devices(self.device_manager.clone()),
+                    Message::DevicesRefreshed,
+                )
+            }
+            Message::DeviceSelected(id) => {
+                self.selected_device = Some(id);
+                Task::none()
+            }
+            Message::SongSelected(id) => {
+                self.selected_song = Some(id);
+                Task::none()
+            }
+            Message::SearchChanged(query) => {
+                self.search_query = query;
+                Task::none()
+            }
+            Message::PlayPressed => {
+                if self.is_preparing_playback {
+                    return Task::none();
+                }
+
+                let song_id = match self.selected_song {
+                    Some(id) => id,
+                    None => {
+                        self.error_message = Some("Select a MIDI file to play".into());
+                        return Task::none();
+                    }
+                };
+
+                let device_id = match self.selected_device {
+                    Some(id) => id,
+                    None => {
+                        self.error_message = Some("Select a MIDI output device first".into());
+                        return Task::none();
+                    }
+                };
+
+                let entry = match self.library.get(&song_id).cloned() {
+                    Some(entry) => entry,
+                    None => {
+                        self.error_message =
+                            Some("Selected MIDI file is no longer available".into());
+                        return Task::none();
+                    }
+                };
+
+                self.is_preparing_playback = true;
+                self.playback_phase = PlaybackPhase::Preparing;
+                self.status_message = Some(format!("Preparing {}", entry.name));
+
+                let path = entry.path.clone();
+                Task::perform(
+                    prepare_playback(path, device_id, self.device_manager.clone()),
+                    Message::PlaybackPrepared,
+                )
+            }
+            Message::PlaybackPrepared(result) => {
+                self.is_preparing_playback = false;
+                match result {
+                    Ok(prepared) => {
+                        match self
+                            .midi_player
+                            .start_playback(prepared.sequence.clone(), prepared.sink.clone())
+                        {
+                            Ok(_) => {
+                                self.current_sink = Some(prepared.sink);
+                                self.playback_phase = PlaybackPhase::Playing;
+                                self.playback_progress = Some(PlaybackProgress {
+                                    elapsed: Duration::ZERO,
+                                    total: prepared.sequence.duration,
+                                });
+                            }
+                            Err(err) => {
+                                self.error_message =
+                                    Some(format!("Failed to start playback: {err:?}"));
+                                self.playback_phase = PlaybackPhase::Idle;
+                                self.playback_progress = None;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        self.error_message = Some(format!("Failed to prepare playback: {err}"));
+                        self.playback_phase = PlaybackPhase::Idle;
+                        self.playback_progress = None;
+                    }
+                }
+                Task::none()
+            }
+            Message::StopPressed => {
+                self.midi_player.stop();
+                self.playback_phase = PlaybackPhase::Idle;
+                self.playback_progress = None;
+                self.current_sink = None;
+                Task::none()
+            }
+            Message::AddLocalFile => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("MIDI Files", &["mid", "midi"])
+                    .pick_file()
+                {
+                    match self.library.add_local_file(path) {
+                        Ok(entry) => {
+                            self.selected_song = Some(entry.id);
+                            self.status_message = Some(format!("Added {}", entry.name));
+                        }
+                        Err(err) => {
+                            self.error_message = Some(format!("Failed to add MIDI file: {err:?}"));
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::Tick => {
+                while let Ok(event) = self.player_events.try_recv() {
+                    self.handle_player_event(event);
+                }
+                Task::none()
+            }
+            Message::DismissStatus => {
+                self.status_message = None;
+                self.error_message = None;
+                Task::none()
+            }
+        }
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        let content = column![
+            self.device_section(),
+            self.playback_controls(),
+            self.library_view(),
+            self.status_banner()
+        ]
+        .spacing(16)
+        .padding(16);
+
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Horizontal::Left)
+            .align_y(Vertical::Top)
+            .into()
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        time::every(TICK_INTERVAL).map(|_| Message::Tick)
+    }
+
+    fn theme(&self) -> Theme {
+        Theme::Dark
     }
 
     fn handle_player_event(&mut self, event: PlayerEvent) {
@@ -102,7 +332,7 @@ impl MidiPianoApp {
         }
     }
 
-    fn filtered_entries(&self) -> Vec<&MidiEntry> {
+    fn filtered_entries(&self) -> Vec<&crate::midi::MidiEntry> {
         if self.search_query.trim().is_empty() {
             return self.library.entries().iter().collect();
         }
@@ -113,216 +343,7 @@ impl MidiPianoApp {
             .filter(|entry| entry.name.to_lowercase().contains(&query))
             .collect()
     }
-}
 
-impl Application for MidiPianoApp {
-    type Executor = executor::Default;
-    type Message = Message;
-    type Theme = Theme;
-    type Flags = ();
-
-    fn new(_flags: ()) -> (Self, Command<Self::Message>) {
-        MidiPianoApp::new_state()
-    }
-
-    fn title(&self) -> String {
-        "MIDI Piano Player".to_string()
-    }
-
-    fn update(&mut self, message: Self::Message) -> Command<Self::Message> {
-        match message {
-            Message::LibraryLoaded(result) => {
-                match result {
-                    Ok(library) => {
-                        self.library = library;
-                        self.status_message = Some("Library loaded".into());
-                    }
-                    Err(err) => {
-                        self.error_message = Some(format!("Failed to load MIDI library: {err}"));
-                    }
-                }
-                Command::none()
-            }
-            Message::DevicesRefreshed(result) => {
-                self.is_scanning_devices = false;
-                match result {
-                    Ok(descriptors) => {
-                        self.devices = descriptors.iter().map(DeviceChoice::from).collect();
-                        if let Some(selected) = self.selected_device {
-                            if !self.devices.iter().any(|choice| choice.id == selected) {
-                                self.selected_device = None;
-                            }
-                        }
-                        self.status_message = Some("Devices updated".into());
-                    }
-                    Err(err) => {
-                        self.error_message = Some(format!("Failed to refresh devices: {err}"));
-                    }
-                }
-                Command::none()
-            }
-            Message::RefreshDevices => {
-                self.is_scanning_devices = true;
-                Command::perform(
-                    refresh_devices(self.device_manager.clone()),
-                    Message::DevicesRefreshed,
-                )
-            }
-            Message::DeviceSelected(id) => {
-                self.selected_device = Some(id);
-                Command::none()
-            }
-            Message::SongSelected(id) => {
-                self.selected_song = Some(id);
-                Command::none()
-            }
-            Message::SearchChanged(query) => {
-                self.search_query = query;
-                Command::none()
-            }
-            Message::PlayPressed => {
-                if self.is_preparing_playback {
-                    return Command::none();
-                }
-
-                let song_id = match self.selected_song {
-                    Some(id) => id,
-                    None => {
-                        self.error_message = Some("Select a MIDI file to play".into());
-                        return Command::none();
-                    }
-                };
-
-                let device_id = match self.selected_device {
-                    Some(id) => id,
-                    None => {
-                        self.error_message = Some("Select a MIDI output device first".into());
-                        return Command::none();
-                    }
-                };
-
-                let entry = match self.library.get(&song_id).cloned() {
-                    Some(entry) => entry,
-                    None => {
-                        self.error_message =
-                            Some("Selected MIDI file is no longer available".into());
-                        return Command::none();
-                    }
-                };
-
-                self.is_preparing_playback = true;
-                self.playback_phase = PlaybackPhase::Preparing;
-                self.status_message = Some(format!("Preparing {}", entry.name));
-
-                let path = entry.path.clone();
-
-                Command::perform(
-                    prepare_playback(path, device_id, self.device_manager.clone()),
-                    Message::PlaybackPrepared,
-                )
-            }
-            Message::PlaybackPrepared(result) => {
-                self.is_preparing_playback = false;
-                match result {
-                    Ok(prepared) => {
-                        match self
-                            .midi_player
-                            .start_playback(prepared.sequence.clone(), prepared.sink.clone())
-                        {
-                            Ok(_) => {
-                                self.current_sink = Some(prepared.sink);
-                                self.playback_phase = PlaybackPhase::Playing;
-                                self.playback_progress = Some(PlaybackProgress {
-                                    elapsed: Duration::ZERO,
-                                    total: prepared.sequence.duration,
-                                });
-                            }
-                            Err(err) => {
-                                self.error_message =
-                                    Some(format!("Failed to start playback: {err:?}"));
-                                self.playback_phase = PlaybackPhase::Idle;
-                                self.playback_progress = None;
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        self.error_message = Some(format!("Failed to prepare playback: {err}"));
-                        self.playback_phase = PlaybackPhase::Idle;
-                        self.playback_progress = None;
-                    }
-                }
-                Command::none()
-            }
-            Message::StopPressed => {
-                self.midi_player.stop();
-                self.playback_phase = PlaybackPhase::Idle;
-                self.playback_progress = None;
-                self.current_sink = None;
-                Command::none()
-            }
-            Message::AddLocalFile => {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("MIDI Files", &["mid", "midi"])
-                    .pick_file()
-                {
-                    match self.library.add_local_file(path) {
-                        Ok(entry) => {
-                            self.selected_song = Some(entry.id);
-                            self.status_message = Some(format!("Added {}", entry.name));
-                        }
-                        Err(err) => {
-                            self.error_message = Some(format!("Failed to add MIDI file: {err:?}"));
-                        }
-                    }
-                }
-                Command::none()
-            }
-            Message::Tick => {
-                while let Ok(event) = self.player_events.try_recv() {
-                    self.handle_player_event(event);
-                }
-                Command::none()
-            }
-            Message::DismissStatus => {
-                self.status_message = None;
-                self.error_message = None;
-                Command::none()
-            }
-        }
-    }
-
-    fn view(&self) -> Element<'_, Self::Message> {
-        let device_section = self.device_section();
-        let playback_section = self.playback_controls();
-        let library_view = self.library_view();
-
-        let content = column![
-            device_section,
-            playback_section,
-            library_view,
-            self.status_banner()
-        ]
-        .spacing(16)
-        .padding(16);
-
-        container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(Horizontal::Left)
-            .align_y(Vertical::Top)
-            .into()
-    }
-
-    fn theme(&self) -> Self::Theme {
-        Theme::Dark
-    }
-
-    fn subscription(&self) -> Subscription<Self::Message> {
-        time::every(TICK_INTERVAL).map(|_| Message::Tick)
-    }
-}
-
-impl MidiPianoApp {
     fn device_section(&self) -> Element<'_, Message> {
         let selected_choice = self
             .selected_device
@@ -343,20 +364,26 @@ impl MidiPianoApp {
         let refresh_button = button("Refresh").on_press(Message::RefreshDevices);
         let add_button = button("Add Local MIDI").on_press(Message::AddLocalFile);
 
-        row![pick_list, refresh_button, add_button]
-            .spacing(12)
-            .into()
+        row![
+            pick_list,
+            refresh_button.style(iced::widget::button::secondary),
+            add_button.style(iced::widget::button::secondary)
+        ]
+        .spacing(12)
+        .into()
     }
 
     fn playback_controls(&self) -> Element<'_, Message> {
         let play_button = button("Play")
             .on_press(Message::PlayPressed)
-            .style(iced::theme::Button::Primary);
-        let stop_button = button("Stop").on_press(Message::StopPressed);
+            .style(iced::widget::button::primary);
+        let stop_button = button("Stop")
+            .on_press(Message::StopPressed)
+            .style(iced::widget::button::secondary);
 
-        let mut status_text = match self.playback_phase {
-            PlaybackPhase::Idle => text("Ready").size(16),
-            PlaybackPhase::Preparing => text("Preparing playback...").size(16),
+        let status_text = match self.playback_phase {
+            PlaybackPhase::Idle => text("Ready"),
+            PlaybackPhase::Preparing => text("Preparing playback..."),
             PlaybackPhase::Playing => {
                 if let Some(progress) = &self.playback_progress {
                     text(format!(
@@ -364,19 +391,18 @@ impl MidiPianoApp {
                         format_duration(progress.elapsed),
                         format_duration(progress.total)
                     ))
-                    .size(16)
                 } else {
-                    text("Playing...").size(16)
+                    text("Playing...")
                 }
             }
-            PlaybackPhase::Finished => text("Completed").size(16),
-        };
-
-        status_text = status_text.width(Length::Fill);
+            PlaybackPhase::Finished => text("Completed"),
+        }
+        .size(16)
+        .width(Length::Fill);
 
         row![play_button, stop_button, status_text]
             .spacing(12)
-            .align_items(iced::Alignment::Center)
+            .align_y(iced::Alignment::Center)
             .into()
     }
 
@@ -394,11 +420,12 @@ impl MidiPianoApp {
             } else {
                 entry.name.clone()
             };
-            let mut row = button(text(label)).on_press(Message::SongSelected(entry.id));
+
+            let mut button = button(text(label)).on_press(Message::SongSelected(entry.id));
             if is_selected {
-                row = row.style(iced::theme::Button::Positive);
+                button = button.style(iced::widget::button::success);
             }
-            list_column = list_column.push(row);
+            list_column = list_column.push(button);
         }
 
         let scroll = scrollable(list_column).height(Length::Fill);
@@ -412,10 +439,10 @@ impl MidiPianoApp {
     fn status_banner(&self) -> Element<'_, Message> {
         if let Some(error) = &self.error_message {
             return row![
-                text(error)
-                    .size(16)
-                    .style(iced::theme::Text::Color(Color::from_rgb(0.9, 0.4, 0.4))),
-                button("Dismiss").on_press(Message::DismissStatus)
+                text(error).size(16).color(Color::from_rgb(0.9, 0.4, 0.4)),
+                button("Dismiss")
+                    .on_press(Message::DismissStatus)
+                    .style(iced::widget::button::secondary)
             ]
             .spacing(8)
             .into();
@@ -423,10 +450,10 @@ impl MidiPianoApp {
 
         if let Some(status) = &self.status_message {
             return row![
-                text(status)
-                    .size(16)
-                    .style(iced::theme::Text::Color(Color::from_rgb(0.4, 0.9, 0.4))),
-                button("Dismiss").on_press(Message::DismissStatus)
+                text(status).size(16).color(Color::from_rgb(0.4, 0.9, 0.4)),
+                button("Dismiss")
+                    .on_press(Message::DismissStatus)
+                    .style(iced::widget::button::secondary)
             ]
             .spacing(8)
             .into();
@@ -436,50 +463,7 @@ impl MidiPianoApp {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum Message {
-    LibraryLoaded(AsyncResult<MidiLibrary>),
-    DevicesRefreshed(AsyncResult<Vec<MidiDeviceDescriptor>>),
-    DeviceSelected(Uuid),
-    SongSelected(Uuid),
-    SearchChanged(String),
-    PlayPressed,
-    StopPressed,
-    AddLocalFile,
-    PlaybackPrepared(AsyncResult<PreparedPlayback>),
-    RefreshDevices,
-    Tick,
-    DismissStatus,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DeviceChoice {
-    id: Uuid,
-    name: String,
-    transport: MidiTransport,
-}
-
-impl DeviceChoice {
-    fn from(descriptor: &MidiDeviceDescriptor) -> Self {
-        DeviceChoice {
-            id: descriptor.info.id,
-            name: descriptor.info.name.clone(),
-            transport: descriptor.info.transport,
-        }
-    }
-}
-
-impl std::fmt::Display for DeviceChoice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let transport = match self.transport {
-            MidiTransport::Usb => "USB",
-            MidiTransport::Bluetooth => "BLE",
-        };
-        write!(f, "[{transport}] {}", self.name)
-    }
-}
-
-pub struct PreparedPlayback {
+struct PreparedPlayback {
     sequence: Arc<MidiSequence>,
     sink: SharedMidiSink,
 }
@@ -556,4 +540,28 @@ fn format_duration(duration: Duration) -> String {
     let minutes = total_secs / 60;
     let seconds = total_secs % 60;
     format!("{minutes:02}:{seconds:02}")
+}
+
+fn update(state: &mut MidiPianoApp, message: Message) -> Task<Message> {
+    state.update(message)
+}
+
+fn view(state: &MidiPianoApp) -> Element<'_, Message> {
+    state.view()
+}
+
+fn subscription(state: &MidiPianoApp) -> Subscription<Message> {
+    state.subscription()
+}
+
+fn theme(state: &MidiPianoApp) -> Theme {
+    state.theme()
+}
+
+pub fn run() -> iced::Result {
+    application("MIDI Piano Player", update, view)
+        .subscription(subscription)
+        .theme(theme)
+        .executor::<executor::Default>()
+        .run_with(MidiPianoApp::init)
 }
