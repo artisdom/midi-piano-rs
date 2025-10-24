@@ -8,7 +8,9 @@ use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{
     Column, button, column, container, pick_list, row, scrollable, text, text::Shaping, text_input,
 };
-use iced::{Color, Element, Font, Length, Subscription, Task, Theme, application, executor, time};
+use iced::{
+    Color, Element, Font, Length, Subscription, Task, Theme, application, executor, time, window,
+};
 use rand::{
     rng,
     seq::{IndexedRandom, IteratorRandom, SliceRandom},
@@ -922,6 +924,15 @@ impl MidiPianoApp {
         format!("{}: {}/{}", mode_label, queue.index + 1, queue.tracks.len())
     }
 
+    fn current_track_label(&self) -> String {
+        if let Some(id) = self.selected_song {
+            if let Some(entry) = self.library.get(&id) {
+                return format!("Now: {}", entry.name);
+            }
+        }
+        "Now: --".into()
+    }
+
     fn play_track(&mut self, track_id: Uuid) -> Task<Message> {
         if self.is_preparing_playback {
             self.status_message = Some("Already preparing a track".into());
@@ -1084,13 +1095,16 @@ impl MidiPianoApp {
             text("Queue: none").shaping(Shaping::Advanced)
         };
 
+        let current_text = text(self.current_track_label()).shaping(Shaping::Advanced);
+
         row![
             prev_button,
             play_button,
             stop_button,
             next_button,
             status_text,
-            queue_text
+            queue_text,
+            current_text
         ]
         .spacing(12)
         .align_y(iced::Alignment::Center)
@@ -1522,10 +1536,32 @@ fn theme(state: &MidiPianoApp) -> Theme {
     state.theme()
 }
 
+fn build_window_icon() -> Option<window::Icon> {
+    let size: u32 = 24;
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let xf = x as f32 / size as f32;
+            let yf = y as f32 / size as f32;
+            let r = (200.0 - 80.0 * xf) as u8;
+            let g = (120.0 + 100.0 * yf) as u8;
+            let b = 220u8;
+            rgba.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+    window::icon::from_rgba(rgba, size, size).ok()
+}
+
 pub fn run() -> iced::Result {
+    let icon = build_window_icon();
+    let window_settings = window::Settings {
+        icon,
+        ..window::Settings::default()
+    };
     application("MIDI Piano Player", update, view)
         .subscription(subscription)
         .theme(theme)
+        .window(window_settings)
         .font(NOTO_SANS_SC)
         .default_font(DEFAULT_FONT)
         .executor::<executor::Default>()
