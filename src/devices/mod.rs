@@ -284,8 +284,9 @@ impl MidiSink for BleMidiSink {
 }
 
 fn pack_ble_midi_message(data: &[u8]) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(data.len() + 1);
-    packet.push(0x80); // Timestamp with zero offset.
+    let mut packet = Vec::with_capacity(data.len() + 2);
+    packet.push(0x80); // packet header (timestamp-high, 0ms)
+    packet.push(0x80); // event timestamp (delta 0)
     packet.extend_from_slice(data);
     packet
 }
