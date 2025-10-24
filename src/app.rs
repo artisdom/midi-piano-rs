@@ -9,6 +9,10 @@ use iced::widget::{
     Column, button, column, container, pick_list, row, scrollable, text, text::Shaping, text_input,
 };
 use iced::{Color, Element, Font, Length, Subscription, Task, Theme, application, executor, time};
+use rand::{
+    rng,
+    seq::{IndexedRandom, IteratorRandom, SliceRandom},
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
@@ -50,6 +54,11 @@ enum Message {
     PlaylistDraftNameChanged(String),
     PlaylistDraftClear,
     PlaylistDraftSave,
+    StartPlayback(Uuid),
+    PlayFavorites { shuffle: bool },
+    PlayPlaylist { id: Uuid, shuffle: bool },
+    NextTrack,
+    PrevTrack,
     PlaylistSelect(Option<Uuid>),
     PlaylistDelete(Uuid),
     PlaylistLoadToDraft(Uuid),
@@ -138,6 +147,20 @@ struct PlaylistDraft {
 }
 
 #[derive(Debug, Clone)]
+struct PlayQueue {
+    tracks: Vec<Uuid>,
+    index: usize,
+    mode: QueueMode,
+}
+
+#[derive(Debug, Clone)]
+enum QueueMode {
+    Single,
+    Favorites,
+    Playlist(Uuid),
+}
+
+#[derive(Debug, Clone)]
 struct LibraryNode {
     id: String,
     name: String,
@@ -191,6 +214,7 @@ pub struct MidiPianoApp {
     playlist_draft: PlaylistDraft,
     selected_playlist: Option<Uuid>,
     show_favorites_only: bool,
+    play_queue: Option<PlayQueue>,
 }
 
 impl MidiPianoApp {
@@ -225,6 +249,7 @@ impl MidiPianoApp {
             playlist_draft: PlaylistDraft::default(),
             selected_playlist: None,
             show_favorites_only: false,
+            play_queue: None,
         };
 
         let task = Task::batch([
@@ -431,6 +456,11 @@ impl MidiPianoApp {
                     if self.selected_playlist == Some(id) {
                         self.selected_playlist = None;
                     }
+                    if let Some(queue) = &self.play_queue {
+                        if matches!(queue.mode, QueueMode::Playlist(queue_id) if queue_id == id) {
+                            self.play_queue = None;
+                        }
+                    }
                     self.status_message = Some("Playlist deleted".into());
                     self.save_preferences_task()
                 } else {
@@ -453,7 +483,6 @@ impl MidiPianoApp {
                 Task::none()
             }
             Message::GenerateRandomPlaylist => {
-                use rand::seq::IteratorRandom;
                 let mut rng = rand::rng();
                 let selection: Vec<Uuid> = self
                     .library
@@ -466,40 +495,30 @@ impl MidiPianoApp {
                 self.status_message = Some("Generated random playlist draft".into());
                 Task::none()
             }
-            Message::PlayPressed => {
-                if self.is_preparing_playback {
-                    return Task::none();
+            Message::StartPlayback(id) => self.start_single_track(id),
+            Message::PlayFavorites { shuffle } => self.play_favorites(shuffle),
+            Message::PlayPlaylist { id, shuffle } => self.play_playlist(id, shuffle),
+            Message::NextTrack => {
+                if let Some(next_id) = self.advance_queue(true) {
+                    self.play_track(next_id)
+                } else {
+                    Task::none()
                 }
-                let song_id = match self.selected_song {
-                    Some(id) => id,
-                    None => {
-                        self.error_message = Some("Select a MIDI file to play".into());
-                        return Task::none();
-                    }
-                };
-                let device_id = match self.selected_device {
-                    Some(id) => id,
-                    None => {
-                        self.error_message = Some("Select a MIDI output device first".into());
-                        return Task::none();
-                    }
-                };
-                let entry = match self.library.get(&song_id).cloned() {
-                    Some(entry) => entry,
-                    None => {
-                        self.error_message =
-                            Some("Selected MIDI file is no longer available".into());
-                        return Task::none();
-                    }
-                };
-                self.is_preparing_playback = true;
-                self.playback_phase = PlaybackPhase::Preparing;
-                self.status_message = Some(format!("Preparing {}", entry.name));
-                let path = entry.path.clone();
-                Task::perform(
-                    prepare_playback(path, device_id, self.device_manager.clone()),
-                    Message::PlaybackPrepared,
-                )
+            }
+            Message::PrevTrack => {
+                if let Some(prev_id) = self.advance_queue(false) {
+                    self.play_track(prev_id)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::PlayPressed => {
+                if let Some(id) = self.selected_song {
+                    self.start_single_track(id)
+                } else {
+                    self.error_message = Some("Select a MIDI file to play".into());
+                    Task::none()
+                }
             }
             Message::PlaybackPrepared(result) => {
                 self.is_preparing_playback = false;
@@ -538,6 +557,7 @@ impl MidiPianoApp {
                 self.playback_phase = PlaybackPhase::Idle;
                 self.playback_progress = None;
                 self.current_sink = None;
+                self.play_queue = None;
                 Task::none()
             }
             Message::AddLocalFile => {
@@ -549,6 +569,7 @@ impl MidiPianoApp {
                         Ok(entry) => {
                             self.selected_song = Some(entry.id);
                             self.status_message = Some(format!("Added {}", entry.name));
+                            self.rebuild_library_tree();
                         }
                         Err(err) => {
                             self.error_message = Some(format!("Failed to add MIDI file: {err:?}"));
@@ -558,10 +579,17 @@ impl MidiPianoApp {
                 Task::none()
             }
             Message::Tick => {
+                let mut tasks = Vec::new();
                 while let Ok(event) = self.player_events.try_recv() {
-                    self.handle_player_event(event);
+                    if let Some(task) = self.handle_player_event(event) {
+                        tasks.push(task);
+                    }
                 }
-                Task::none()
+                if tasks.is_empty() {
+                    Task::none()
+                } else {
+                    Task::batch(tasks)
+                }
             }
             Message::DismissStatus => {
                 self.status_message = None;
@@ -599,7 +627,7 @@ impl MidiPianoApp {
         Theme::Dark
     }
 
-    fn handle_player_event(&mut self, event: PlayerEvent) {
+    fn handle_player_event(&mut self, event: PlayerEvent) -> Option<Task<Message>> {
         match event {
             PlayerEvent::Started { total } => {
                 self.playback_phase = PlaybackPhase::Playing;
@@ -608,26 +636,35 @@ impl MidiPianoApp {
                     total,
                 });
                 self.status_message = Some("Playback started".into());
+                None
             }
             PlayerEvent::Progress { elapsed, total } => {
                 self.playback_progress = Some(PlaybackProgress { elapsed, total });
+                None
             }
             PlayerEvent::Finished => {
                 self.playback_phase = PlaybackPhase::Finished;
-                self.status_message = Some("Playback finished".into());
                 self.current_sink = None;
+                if let Some(next_id) = self.advance_queue(true) {
+                    Some(self.play_track(next_id))
+                } else {
+                    self.status_message = Some("Playback finished".into());
+                    None
+                }
             }
             PlayerEvent::Stopped => {
                 self.playback_phase = PlaybackPhase::Idle;
                 self.playback_progress = None;
                 self.status_message = Some("Playback stopped".into());
                 self.current_sink = None;
+                None
             }
             PlayerEvent::Error(message) => {
                 self.error_message = Some(message);
                 self.playback_phase = PlaybackPhase::Idle;
                 self.playback_progress = None;
                 self.current_sink = None;
+                None
             }
         }
     }
@@ -711,6 +748,214 @@ impl MidiPianoApp {
         base
     }
 
+    fn start_single_track(&mut self, track_id: Uuid) -> Task<Message> {
+        if self.library.get(&track_id).is_none() {
+            self.error_message = Some("Selected track is not available".into());
+            return Task::none();
+        }
+        self.queue_with_tracks(vec![track_id], track_id, QueueMode::Single, false);
+        self.play_track(track_id)
+    }
+
+    fn play_favorites(&mut self, shuffle: bool) -> Task<Message> {
+        let mut entries: Vec<_> = self
+            .user_prefs
+            .favorites
+            .iter()
+            .filter_map(|id| self.library.get(id))
+            .collect();
+        entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        let tracks: Vec<Uuid> = entries.iter().map(|entry| entry.id).collect();
+        if tracks.is_empty() {
+            self.error_message = Some("No favorites available to play".into());
+            return Task::none();
+        }
+        let start_track = if shuffle {
+            let mut rng = rng();
+            *tracks.as_slice().choose(&mut rng).unwrap()
+        } else {
+            tracks[0]
+        };
+        if self.queue_with_tracks(tracks, start_track, QueueMode::Favorites, shuffle) {
+            self.status_message = Some("Playing favorites".into());
+            self.play_track(start_track)
+        } else {
+            Task::none()
+        }
+    }
+
+    fn play_playlist(&mut self, playlist_id: Uuid, shuffle: bool) -> Task<Message> {
+        let playlist = match self
+            .user_prefs
+            .playlists
+            .iter()
+            .find(|playlist| playlist.id == playlist_id)
+            .cloned()
+        {
+            Some(playlist) => playlist,
+            None => {
+                self.error_message = Some("Playlist not found".into());
+                return Task::none();
+            }
+        };
+
+        let tracks: Vec<Uuid> = playlist
+            .tracks
+            .iter()
+            .filter_map(|id| self.library.get(id).map(|entry| entry.id))
+            .collect();
+
+        if tracks.is_empty() {
+            self.error_message = Some("Playlist has no playable tracks".into());
+            return Task::none();
+        }
+
+        let start_track = if shuffle {
+            let mut rng = rng();
+            *tracks.as_slice().choose(&mut rng).unwrap()
+        } else {
+            tracks[0]
+        };
+
+        if self.queue_with_tracks(
+            tracks,
+            start_track,
+            QueueMode::Playlist(playlist_id),
+            shuffle,
+        ) {
+            self.status_message = Some(format!("Playing playlist '{}'", playlist.name));
+            self.play_track(start_track)
+        } else {
+            Task::none()
+        }
+    }
+
+    fn queue_with_tracks(
+        &mut self,
+        tracks: Vec<Uuid>,
+        start_track: Uuid,
+        mode: QueueMode,
+        shuffle: bool,
+    ) -> bool {
+        if self.library.get(&start_track).is_none() {
+            self.error_message = Some("Selected track is not available".into());
+            return false;
+        }
+
+        let mut seen = HashSet::new();
+        let mut ordered = Vec::new();
+        for id in tracks.into_iter() {
+            if self.library.get(&id).is_some() && seen.insert(id) {
+                ordered.push(id);
+            }
+        }
+
+        if ordered.is_empty() {
+            self.play_queue = None;
+            return false;
+        }
+
+        if seen.insert(start_track) {
+            ordered.insert(0, start_track);
+        }
+
+        if shuffle {
+            let mut rng = rng();
+            ordered.shuffle(&mut rng);
+        }
+
+        if let Some(pos) = ordered.iter().position(|id| *id == start_track) {
+            ordered.swap(0, pos);
+        } else {
+            ordered.insert(0, start_track);
+        }
+
+        self.play_queue = Some(PlayQueue {
+            tracks: ordered,
+            index: 0,
+            mode,
+        });
+        self.selected_song = Some(start_track);
+        true
+    }
+
+    fn advance_queue(&mut self, forward: bool) -> Option<Uuid> {
+        let queue = self.play_queue.as_mut()?;
+        if queue.tracks.is_empty() {
+            self.play_queue = None;
+            return None;
+        }
+        if forward {
+            if queue.index + 1 < queue.tracks.len() {
+                queue.index += 1;
+                let track = queue.tracks[queue.index];
+                self.selected_song = Some(track);
+                Some(track)
+            } else {
+                self.play_queue = None;
+                self.status_message = Some("Queue finished".into());
+                None
+            }
+        } else if queue.index > 0 {
+            queue.index -= 1;
+            let track = queue.tracks[queue.index];
+            self.selected_song = Some(track);
+            Some(track)
+        } else {
+            self.status_message = Some("Already at the beginning".into());
+            None
+        }
+    }
+
+    fn queue_label(&self, queue: &PlayQueue) -> String {
+        let mode_label = match &queue.mode {
+            QueueMode::Single => "Single".to_string(),
+            QueueMode::Favorites => "Favorites".to_string(),
+            QueueMode::Playlist(id) => self
+                .user_prefs
+                .playlists
+                .iter()
+                .find(|playlist| &playlist.id == id)
+                .map(|playlist| playlist.name.clone())
+                .unwrap_or_else(|| "Playlist".into()),
+        };
+        format!("{}: {}/{}", mode_label, queue.index + 1, queue.tracks.len())
+    }
+
+    fn play_track(&mut self, track_id: Uuid) -> Task<Message> {
+        if self.is_preparing_playback {
+            self.status_message = Some("Already preparing a track".into());
+            return Task::none();
+        }
+
+        let entry = match self.library.get(&track_id).cloned() {
+            Some(entry) => entry,
+            None => {
+                self.error_message = Some("Track not available".into());
+                return Task::none();
+            }
+        };
+
+        let device_id = match self.selected_device {
+            Some(id) => id,
+            None => {
+                self.error_message = Some("Select a MIDI output device first".into());
+                return Task::none();
+            }
+        };
+
+        self.is_preparing_playback = true;
+        self.playback_phase = PlaybackPhase::Preparing;
+        self.status_message = Some(format!("Preparing {}", entry.name));
+        self.selected_song = Some(track_id);
+        let path = entry.path.clone();
+
+        Task::perform(
+            prepare_playback(path, device_id, self.device_manager.clone()),
+            Message::PlaybackPrepared,
+        )
+    }
+
     fn device_section(&self) -> Element<'_, Message> {
         let selected_choice = self
             .selected_device
@@ -776,17 +1021,40 @@ impl MidiPianoApp {
             button.on_press(Message::ToggleFavoritesOnly(!self.show_favorites_only))
         };
 
-        row![list_button, tree_button, favorites_button]
-            .spacing(12)
-            .into()
+        let favorites_play_seq = button("Play Favorites")
+            .on_press(Message::PlayFavorites { shuffle: false })
+            .style(iced::widget::button::primary);
+
+        let favorites_play_shuffle = button("Shuffle Favorites")
+            .on_press(Message::PlayFavorites { shuffle: true })
+            .style(iced::widget::button::secondary);
+
+        row![
+            list_button,
+            tree_button,
+            favorites_button,
+            favorites_play_seq,
+            favorites_play_shuffle
+        ]
+        .spacing(12)
+        .into()
     }
 
     fn playback_controls(&self) -> Element<'_, Message> {
-        let play_button = button("Play")
+        let prev_button = button("⏮")
+            .on_press(Message::PrevTrack)
+            .style(iced::widget::button::secondary);
+
+        let play_button = button("Play Selected")
             .on_press(Message::PlayPressed)
             .style(iced::widget::button::primary);
+
         let stop_button = button("Stop")
             .on_press(Message::StopPressed)
+            .style(iced::widget::button::secondary);
+
+        let next_button = button("⏭")
+            .on_press(Message::NextTrack)
             .style(iced::widget::button::secondary);
 
         let status_text = match self.playback_phase {
@@ -809,10 +1077,24 @@ impl MidiPianoApp {
         .size(16)
         .width(Length::Fill);
 
-        row![play_button, stop_button, status_text]
-            .spacing(12)
-            .align_y(iced::Alignment::Center)
-            .into()
+        let queue_text = if let Some(queue) = &self.play_queue {
+            let label = self.queue_label(queue);
+            text(label).shaping(Shaping::Advanced)
+        } else {
+            text("Queue: none").shaping(Shaping::Advanced)
+        };
+
+        row![
+            prev_button,
+            play_button,
+            stop_button,
+            next_button,
+            status_text,
+            queue_text
+        ]
+        .spacing(12)
+        .align_y(iced::Alignment::Center)
+        .into()
     }
 
     fn library_view(&self) -> Element<'_, Message> {
@@ -839,6 +1121,10 @@ impl MidiPianoApp {
                 select_button = select_button.style(iced::widget::button::secondary);
             }
 
+            let play_button = button(text("▶").shaping(Shaping::Advanced))
+                .style(iced::widget::button::primary)
+                .on_press(Message::StartPlayback(entry.id));
+
             let current_rating = self.user_prefs.ratings.get(&entry.id).copied().unwrap_or(0);
             let mut stars_row = row![];
             for star in 1..=5u8 {
@@ -864,8 +1150,14 @@ impl MidiPianoApp {
                 .style(iced::widget::button::secondary)
                 .on_press(Message::PlaylistDraftAdd(entry.id));
 
-            let entry_row =
-                row![select_button, stars_row, favorite_button, add_button,].spacing(12);
+            let entry_row = row![
+                select_button,
+                play_button,
+                stars_row,
+                favorite_button,
+                add_button,
+            ]
+            .spacing(12);
 
             list_column = list_column.push(entry_row);
         }
@@ -934,7 +1226,8 @@ impl MidiPianoApp {
     fn tree_panel(&self) -> Column<'_, Message> {
         let mut column = Column::new().spacing(4);
 
-        let mut root_button = button(text("All Assets").shaping(Shaping::Advanced));
+        let mut root_button = button(text("All Assets").shaping(Shaping::Advanced))
+            .on_press(Message::SelectFolder("root".into()));
         if self
             .selected_folder
             .as_deref()
@@ -944,7 +1237,7 @@ impl MidiPianoApp {
         } else {
             root_button = root_button.style(iced::widget::button::secondary);
         }
-        column = column.push(root_button.on_press(Message::SelectFolder("root".into())));
+        column = column.push(root_button);
 
         let mut items: Vec<Element<'_, Message>> = Vec::new();
         for child in self.library_tree.children.values() {
@@ -1064,6 +1357,23 @@ impl MidiPianoApp {
         ]
         .spacing(12);
 
+        let playlist_play_row: Element<'_, Message> = if let Some(id) = self.selected_playlist {
+            row![
+                button("Play Selected")
+                    .on_press(Message::PlayPlaylist { id, shuffle: false })
+                    .style(iced::widget::button::primary),
+                button("Shuffle Selected")
+                    .on_press(Message::PlayPlaylist { id, shuffle: true })
+                    .style(iced::widget::button::secondary)
+            ]
+            .spacing(12)
+            .into()
+        } else {
+            text("Select a playlist to play")
+                .shaping(Shaping::Advanced)
+                .into()
+        };
+
         let mut tracks_column = Column::new().spacing(4);
         for (index, track_id) in self.playlist_draft.tracks.iter().cloned().enumerate() {
             if let Some(entry) = self.library.get(&track_id) {
@@ -1081,7 +1391,7 @@ impl MidiPianoApp {
 
         let track_list = scrollable(tracks_column).height(Length::Fixed(200.0));
 
-        column![controls, selection_row, track_list]
+        column![controls, selection_row, playlist_play_row, track_list]
             .spacing(12)
             .into()
     }
