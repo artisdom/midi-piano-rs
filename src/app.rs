@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{
-    Column, button, column, container, pick_list, row, scrollable, text, text_input,
+    Column, button, column, container, pick_list, row, scrollable, text, text::Shaping, text_input,
 };
 use iced::{Color, Element, Font, Length, Subscription, Task, Theme, application, executor, time};
 use tokio::sync::Mutex;
@@ -400,6 +400,7 @@ impl MidiPianoApp {
             }
             PlaybackPhase::Finished => text("Completed"),
         }
+        .shaping(Shaping::Advanced)
         .size(16)
         .width(Length::Fill);
 
@@ -424,7 +425,8 @@ impl MidiPianoApp {
                 entry.name.clone()
             };
 
-            let mut button = button(text(label)).on_press(Message::SongSelected(entry.id));
+            let mut button = button(text(label).shaping(Shaping::Advanced))
+                .on_press(Message::SongSelected(entry.id));
             if is_selected {
                 button = button.style(iced::widget::button::success);
             }
@@ -442,7 +444,10 @@ impl MidiPianoApp {
     fn status_banner(&self) -> Element<'_, Message> {
         if let Some(error) = &self.error_message {
             return row![
-                text(error).size(16).color(Color::from_rgb(0.9, 0.4, 0.4)),
+                text(error)
+                    .shaping(Shaping::Advanced)
+                    .size(16)
+                    .color(Color::from_rgb(0.9, 0.4, 0.4)),
                 button("Dismiss")
                     .on_press(Message::DismissStatus)
                     .style(iced::widget::button::secondary)
@@ -453,7 +458,10 @@ impl MidiPianoApp {
 
         if let Some(status) = &self.status_message {
             return row![
-                text(status).size(16).color(Color::from_rgb(0.4, 0.9, 0.4)),
+                text(status)
+                    .shaping(Shaping::Advanced)
+                    .size(16)
+                    .color(Color::from_rgb(0.4, 0.9, 0.4)),
                 button("Dismiss")
                     .on_press(Message::DismissStatus)
                     .style(iced::widget::button::secondary)
