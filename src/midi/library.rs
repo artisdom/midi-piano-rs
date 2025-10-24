@@ -22,6 +22,7 @@ pub struct MidiEntry {
     pub name: String,
     pub path: PathBuf,
     pub origin: MidiOrigin,
+    pub library_path: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -45,7 +46,21 @@ impl MidiLibrary {
             for item in entries.0 {
                 let candidate = ASSETS_DIR.join(&item);
                 if candidate.exists() {
-                    let _ = library.insert_entry(candidate, MidiOrigin::Asset);
+                    let mut parts: Vec<String> = item
+                        .split('/')
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let _ = library.insert_entry(
+                        candidate,
+                        MidiOrigin::Asset,
+                        if parts.len() > 1 {
+                            parts.pop();
+                            Some(parts)
+                        } else {
+                            None
+                        },
+                    );
                 } else {
                     log::warn!("skipping missing asset entry {}", candidate.display());
                 }
@@ -74,7 +89,7 @@ impl MidiLibrary {
         let entry_id = if let Some(existing) = self.index_by_path.get(&path) {
             *existing
         } else {
-            self.insert_entry(path, MidiOrigin::Local)
+            self.insert_entry(path, MidiOrigin::Local, None)
         };
         self.index_by_id
             .get(&entry_id)
@@ -82,7 +97,12 @@ impl MidiLibrary {
             .context("failed to retrieve newly added MIDI entry")
     }
 
-    fn insert_entry<P: Into<PathBuf>>(&mut self, path: P, origin: MidiOrigin) -> Uuid {
+    fn insert_entry<P: Into<PathBuf>>(
+        &mut self,
+        path: P,
+        origin: MidiOrigin,
+        library_path: Option<Vec<String>>,
+    ) -> Uuid {
         let raw_path: PathBuf = path.into();
         let path = normalize_path(&raw_path);
         let id = Uuid::new_v4();
@@ -96,6 +116,7 @@ impl MidiLibrary {
             name,
             path: path.clone(),
             origin,
+            library_path,
         };
         self.index_by_id.insert(id, self.entries.len());
         self.index_by_path.insert(path, id);

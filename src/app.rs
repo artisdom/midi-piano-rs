@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,6 +9,7 @@ use iced::widget::{
     Column, button, column, container, pick_list, row, scrollable, text, text::Shaping, text_input,
 };
 use iced::{Color, Element, Font, Length, Subscription, Task, Theme, application, executor, time};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use uuid::Uuid;
@@ -22,11 +24,14 @@ type AsyncResult<T> = Result<T, String>;
 
 const NOTO_SANS_SC: &[u8] = include_bytes!("../assets/fonts/NotoSansSC-Regular.otf");
 const DEFAULT_FONT: Font = Font::with_name("Noto Sans SC");
+const USER_DATA_FILE: &str = "data/user_preferences.json";
 
 #[derive(Debug, Clone)]
 enum Message {
     LibraryLoaded(AsyncResult<MidiLibrary>),
     DevicesRefreshed(AsyncResult<Vec<MidiDeviceDescriptor>>),
+    UserDataLoaded(AsyncResult<UserPreferences>),
+    PreferencesSaved(AsyncResult<()>),
     DeviceSelected(Uuid),
     SongSelected(Uuid),
     SearchChanged(String),
@@ -35,6 +40,21 @@ enum Message {
     AddLocalFile,
     PlaybackPrepared(AsyncResult<PreparedPlayback>),
     RefreshDevices,
+    SetRating(Uuid, u8),
+    ToggleFavorite(Uuid),
+    ToggleLibraryView(LibraryView),
+    ToggleFolder(String),
+    SelectFolder(String),
+    PlaylistDraftAdd(Uuid),
+    PlaylistDraftRemove(usize),
+    PlaylistDraftNameChanged(String),
+    PlaylistDraftClear,
+    PlaylistDraftSave,
+    PlaylistSelect(Option<Uuid>),
+    PlaylistDelete(Uuid),
+    PlaylistLoadToDraft(Uuid),
+    GenerateRandomPlaylist,
+    ToggleFavoritesOnly(bool),
     Tick,
     DismissStatus,
 }
@@ -66,6 +86,86 @@ impl fmt::Display for DeviceChoice {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlaylistChoice {
+    id: Uuid,
+    name: String,
+}
+
+impl PlaylistChoice {
+    fn from(playlist: &Playlist) -> Self {
+        Self {
+            id: playlist.id,
+            name: playlist.name.clone(),
+        }
+    }
+}
+
+impl fmt::Display for PlaylistChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct UserPreferences {
+    ratings: HashMap<Uuid, u8>,
+    favorites: HashSet<Uuid>,
+    playlists: Vec<Playlist>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Playlist {
+    id: Uuid,
+    name: String,
+    tracks: Vec<Uuid>,
+}
+
+impl Playlist {
+    fn new(name: impl Into<String>, tracks: Vec<Uuid>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            tracks,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PlaylistDraft {
+    name: String,
+    tracks: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+struct LibraryNode {
+    id: String,
+    name: String,
+    children: BTreeMap<String, LibraryNode>,
+}
+
+impl LibraryNode {
+    fn new(id: String, name: String) -> Self {
+        Self {
+            id,
+            name,
+            children: BTreeMap::new(),
+        }
+    }
+
+    fn ensure_child(&mut self, id: String, name: String) -> &mut LibraryNode {
+        self.children
+            .entry(id.clone())
+            .or_insert_with(|| LibraryNode::new(id, name))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibraryView {
+    Flat,
+    Tree,
+}
+
 pub struct MidiPianoApp {
     library: MidiLibrary,
     device_manager: Arc<Mutex<MidiDeviceManager>>,
@@ -82,12 +182,23 @@ pub struct MidiPianoApp {
     error_message: Option<String>,
     is_scanning_devices: bool,
     is_preparing_playback: bool,
+    user_prefs: UserPreferences,
+    view_mode: LibraryView,
+    library_tree: LibraryNode,
+    folder_entries: HashMap<String, Vec<Uuid>>,
+    expanded_folders: HashSet<String>,
+    selected_folder: Option<String>,
+    playlist_draft: PlaylistDraft,
+    selected_playlist: Option<Uuid>,
+    show_favorites_only: bool,
 }
 
 impl MidiPianoApp {
     fn init() -> (Self, Task<Message>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let device_manager = Arc::new(Mutex::new(MidiDeviceManager::new()));
+        let mut expanded_folders = HashSet::new();
+        expanded_folders.insert("root".into());
 
         let app = MidiPianoApp {
             library: MidiLibrary::default(),
@@ -105,11 +216,21 @@ impl MidiPianoApp {
             error_message: None,
             is_scanning_devices: true,
             is_preparing_playback: false,
+            user_prefs: UserPreferences::default(),
+            view_mode: LibraryView::Flat,
+            library_tree: LibraryNode::new("root".into(), "Library".into()),
+            folder_entries: HashMap::new(),
+            expanded_folders,
+            selected_folder: None,
+            playlist_draft: PlaylistDraft::default(),
+            selected_playlist: None,
+            show_favorites_only: false,
         };
 
         let task = Task::batch([
             Task::perform(load_library(), Message::LibraryLoaded),
             Task::perform(refresh_devices(device_manager), Message::DevicesRefreshed),
+            Task::perform(load_user_preferences(), Message::UserDataLoaded),
         ]);
 
         (app, task)
@@ -121,6 +242,7 @@ impl MidiPianoApp {
                 match result {
                     Ok(library) => {
                         self.library = library;
+                        self.rebuild_library_tree();
                         self.status_message = Some("Library loaded".into());
                     }
                     Err(err) => {
@@ -147,6 +269,29 @@ impl MidiPianoApp {
                 }
                 Task::none()
             }
+            Message::UserDataLoaded(result) => {
+                match result {
+                    Ok(prefs) => {
+                        self.user_prefs = prefs;
+                        self.status_message = Some("Preferences loaded".into());
+                    }
+                    Err(err) => {
+                        self.error_message = Some(format!("Failed to load preferences: {err}"));
+                    }
+                }
+                Task::none()
+            }
+            Message::PreferencesSaved(result) => {
+                match result {
+                    Ok(()) => {
+                        self.status_message = Some("Preferences saved".into());
+                    }
+                    Err(err) => {
+                        self.error_message = Some(format!("Failed to save preferences: {err}"));
+                    }
+                }
+                Task::none()
+            }
             Message::RefreshDevices => {
                 self.is_scanning_devices = true;
                 Task::perform(
@@ -166,11 +311,165 @@ impl MidiPianoApp {
                 self.search_query = query;
                 Task::none()
             }
+            Message::ToggleLibraryView(view) => {
+                if self.view_mode != view {
+                    self.view_mode = view;
+                    if matches!(self.view_mode, LibraryView::Tree) && self.selected_folder.is_none()
+                    {
+                        self.selected_folder = Some("root".into());
+                    }
+                }
+                Task::none()
+            }
+            Message::ToggleFolder(folder_id) => {
+                self.selected_folder = Some(folder_id.clone());
+                if !self.expanded_folders.remove(&folder_id) {
+                    self.expanded_folders.insert(folder_id);
+                }
+                Task::none()
+            }
+            Message::SelectFolder(folder_id) => {
+                if self.folder_entries.contains_key(&folder_id) {
+                    self.selected_folder = Some(folder_id);
+                }
+                Task::none()
+            }
+            Message::ToggleFavoritesOnly(flag) => {
+                self.show_favorites_only = flag;
+                Task::none()
+            }
+            Message::SetRating(id, rating) => {
+                if rating == 0 {
+                    self.user_prefs.ratings.remove(&id);
+                } else if rating <= 5 {
+                    self.user_prefs.ratings.insert(id, rating);
+                }
+                self.status_message = Some("Rating updated".into());
+                self.save_preferences_task()
+            }
+            Message::ToggleFavorite(id) => {
+                if !self.user_prefs.favorites.remove(&id) {
+                    self.user_prefs.favorites.insert(id);
+                    self.status_message = Some("Added to favorites".into());
+                } else {
+                    self.status_message = Some("Removed from favorites".into());
+                }
+                self.save_preferences_task()
+            }
+            Message::PlaylistDraftAdd(id) => {
+                if self.library.get(&id).is_none() {
+                    self.error_message = Some("Selected track is not available".into());
+                } else if !self.playlist_draft.tracks.contains(&id) {
+                    self.playlist_draft.tracks.push(id);
+                    self.status_message = Some("Track added to draft playlist".into());
+                }
+                Task::none()
+            }
+            Message::PlaylistDraftRemove(index) => {
+                if index < self.playlist_draft.tracks.len() {
+                    self.playlist_draft.tracks.remove(index);
+                    self.status_message = Some("Track removed from draft playlist".into());
+                }
+                Task::none()
+            }
+            Message::PlaylistDraftNameChanged(name) => {
+                self.playlist_draft.name = name;
+                Task::none()
+            }
+            Message::PlaylistDraftClear => {
+                self.playlist_draft = PlaylistDraft::default();
+                self.status_message = Some("Playlist draft cleared".into());
+                Task::none()
+            }
+            Message::PlaylistDraftSave => {
+                if self.playlist_draft.tracks.is_empty() {
+                    self.error_message =
+                        Some("Add at least one track before saving a playlist".into());
+                    return Task::none();
+                }
+                let name = if self.playlist_draft.name.trim().is_empty() {
+                    format!("Playlist {}", self.user_prefs.playlists.len() + 1)
+                } else {
+                    self.playlist_draft.name.trim().to_owned()
+                };
+                let tracks = self.playlist_draft.tracks.clone();
+                if let Some(active_id) = self.selected_playlist {
+                    if let Some(existing) = self
+                        .user_prefs
+                        .playlists
+                        .iter_mut()
+                        .find(|playlist| playlist.id == active_id)
+                    {
+                        existing.name = name.clone();
+                        existing.tracks = tracks.clone();
+                        self.status_message = Some(format!("Playlist '{}' updated", existing.name));
+                    } else {
+                        let playlist = Playlist::new(name.clone(), tracks);
+                        self.selected_playlist = Some(playlist.id);
+                        self.user_prefs.playlists.push(playlist);
+                        self.status_message = Some(format!("Playlist '{}' created", name));
+                    }
+                } else {
+                    let playlist = Playlist::new(name.clone(), tracks);
+                    self.selected_playlist = Some(playlist.id);
+                    self.user_prefs.playlists.push(playlist);
+                    self.status_message = Some(format!("Playlist '{}' created", name));
+                }
+                self.playlist_draft.name = name;
+                self.save_preferences_task()
+            }
+            Message::PlaylistSelect(selection) => {
+                self.selected_playlist = selection;
+                Task::none()
+            }
+            Message::PlaylistDelete(id) => {
+                let before = self.user_prefs.playlists.len();
+                self.user_prefs
+                    .playlists
+                    .retain(|playlist| playlist.id != id);
+                if before != self.user_prefs.playlists.len() {
+                    if self.selected_playlist == Some(id) {
+                        self.selected_playlist = None;
+                    }
+                    self.status_message = Some("Playlist deleted".into());
+                    self.save_preferences_task()
+                } else {
+                    Task::none()
+                }
+            }
+            Message::PlaylistLoadToDraft(id) => {
+                if let Some(playlist) = self
+                    .user_prefs
+                    .playlists
+                    .iter()
+                    .find(|playlist| playlist.id == id)
+                    .cloned()
+                {
+                    self.playlist_draft.name = playlist.name.clone();
+                    self.playlist_draft.tracks = playlist.tracks.clone();
+                    self.selected_playlist = Some(id);
+                    self.status_message = Some("Loaded playlist into draft".into());
+                }
+                Task::none()
+            }
+            Message::GenerateRandomPlaylist => {
+                use rand::seq::IteratorRandom;
+                let mut rng = rand::rng();
+                let selection: Vec<Uuid> = self
+                    .library
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.id)
+                    .choose_multiple(&mut rng, 50);
+                self.playlist_draft.name = "Random 50".into();
+                self.playlist_draft.tracks = selection;
+                self.status_message = Some("Generated random playlist draft".into());
+                Task::none()
+            }
             Message::PlayPressed => {
                 if self.is_preparing_playback {
                     return Task::none();
                 }
-
                 let song_id = match self.selected_song {
                     Some(id) => id,
                     None => {
@@ -178,7 +477,6 @@ impl MidiPianoApp {
                         return Task::none();
                     }
                 };
-
                 let device_id = match self.selected_device {
                     Some(id) => id,
                     None => {
@@ -186,7 +484,6 @@ impl MidiPianoApp {
                         return Task::none();
                     }
                 };
-
                 let entry = match self.library.get(&song_id).cloned() {
                     Some(entry) => entry,
                     None => {
@@ -195,11 +492,9 @@ impl MidiPianoApp {
                         return Task::none();
                     }
                 };
-
                 self.is_preparing_playback = true;
                 self.playback_phase = PlaybackPhase::Preparing;
                 self.status_message = Some(format!("Preparing {}", entry.name));
-
                 let path = entry.path.clone();
                 Task::perform(
                     prepare_playback(path, device_id, self.device_manager.clone()),
@@ -280,7 +575,9 @@ impl MidiPianoApp {
         let content = column![
             self.device_section(),
             self.playback_controls(),
+            self.library_controls(),
             self.library_view(),
+            self.playlist_editor(),
             self.status_banner()
         ]
         .spacing(16)
@@ -335,16 +632,83 @@ impl MidiPianoApp {
         }
     }
 
-    fn filtered_entries(&self) -> Vec<&crate::midi::MidiEntry> {
-        if self.search_query.trim().is_empty() {
-            return self.library.entries().iter().collect();
+    fn rebuild_library_tree(&mut self) {
+        let mut root = LibraryNode::new("root".into(), "Library".into());
+        let mut folder_entries: HashMap<String, Vec<Uuid>> = HashMap::new();
+        folder_entries.insert("root".into(), Vec::new());
+
+        for entry in self.library.entries() {
+            if matches!(entry.origin, crate::midi::MidiOrigin::Asset) {
+                folder_entries
+                    .entry("root".into())
+                    .or_insert_with(Vec::new)
+                    .push(entry.id);
+
+                if let Some(segments) = &entry.library_path {
+                    if segments.is_empty() {
+                        continue;
+                    }
+
+                    let mut node = &mut root;
+                    let mut path_builder: Vec<String> = Vec::new();
+                    for segment in segments {
+                        path_builder.push(segment.clone());
+                        let node_id = format!("asset:{}", path_builder.join("/"));
+                        node = node.ensure_child(node_id.clone(), segment.clone());
+                        folder_entries
+                            .entry(node_id.clone())
+                            .or_insert_with(Vec::new);
+                    }
+                    let leaf_id = format!("asset:{}", segments.join("/"));
+                    if let Some(entries) = folder_entries.get_mut(&leaf_id) {
+                        entries.push(entry.id);
+                    }
+                }
+            }
         }
-        let query = self.search_query.to_lowercase();
-        self.library
-            .entries()
-            .iter()
-            .filter(|entry| entry.name.to_lowercase().contains(&query))
-            .collect()
+
+        self.library_tree = root;
+        self.folder_entries = folder_entries;
+        if let Some(selected) = self.selected_folder.clone() {
+            if !self.folder_entries.contains_key(&selected) {
+                self.selected_folder = None;
+            }
+        }
+    }
+
+    fn save_preferences_task(&self) -> Task<Message> {
+        Task::perform(
+            save_user_preferences(self.user_prefs.clone()),
+            Message::PreferencesSaved,
+        )
+    }
+
+    fn visible_entries(&self) -> Vec<&crate::midi::MidiEntry> {
+        let query = self.search_query.trim().to_lowercase();
+
+        let mut base: Vec<&crate::midi::MidiEntry> = match self.view_mode {
+            LibraryView::Flat => self.library.entries().iter().collect(),
+            LibraryView::Tree => {
+                let folder_id = self.selected_folder.as_deref().unwrap_or("root");
+                self.folder_entries
+                    .get(folder_id)
+                    .into_iter()
+                    .flat_map(|ids| ids.iter())
+                    .filter_map(|id| self.library.get(id))
+                    .collect()
+            }
+        };
+
+        if self.show_favorites_only {
+            base.retain(|entry| self.user_prefs.favorites.contains(&entry.id));
+        }
+
+        if !query.is_empty() {
+            base.retain(|entry| entry.name.to_lowercase().contains(&query));
+        }
+
+        base.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        base
     }
 
     fn device_section(&self) -> Element<'_, Message> {
@@ -374,6 +738,47 @@ impl MidiPianoApp {
         ]
         .spacing(12)
         .into()
+    }
+
+    fn library_controls(&self) -> Element<'_, Message> {
+        let list_button = {
+            let mut button = button("List");
+            if matches!(self.view_mode, LibraryView::Flat) {
+                button = button.style(iced::widget::button::success);
+            } else {
+                button = button.style(iced::widget::button::secondary);
+            }
+            button.on_press(Message::ToggleLibraryView(LibraryView::Flat))
+        };
+
+        let tree_button = {
+            let mut button = button("Tree");
+            if matches!(self.view_mode, LibraryView::Tree) {
+                button = button.style(iced::widget::button::success);
+            } else {
+                button = button.style(iced::widget::button::secondary);
+            }
+            button.on_press(Message::ToggleLibraryView(LibraryView::Tree))
+        };
+
+        let favorites_button = {
+            let label = if self.show_favorites_only {
+                "Favorites ✔"
+            } else {
+                "Favorites"
+            };
+            let mut button = button(label);
+            if self.show_favorites_only {
+                button = button.style(iced::widget::button::success);
+            } else {
+                button = button.style(iced::widget::button::secondary);
+            }
+            button.on_press(Message::ToggleFavoritesOnly(!self.show_favorites_only))
+        };
+
+        row![list_button, tree_button, favorites_button]
+            .spacing(12)
+            .into()
     }
 
     fn playback_controls(&self) -> Element<'_, Message> {
@@ -415,27 +820,80 @@ impl MidiPianoApp {
             .on_input(Message::SearchChanged)
             .padding(8);
 
-        let mut list_column = Column::new().spacing(4);
+        let mut list_column = Column::new().spacing(6);
+        let mut has_entries = false;
 
-        for entry in self.filtered_entries() {
+        for entry in self.visible_entries() {
+            has_entries = true;
             let is_selected = Some(entry.id) == self.selected_song;
-            let label = if matches!(entry.origin, crate::midi::MidiOrigin::Local) {
+            let display_name = if matches!(entry.origin, crate::midi::MidiOrigin::Local) {
                 format!("{} (Local)", entry.name)
             } else {
                 entry.name.clone()
             };
-
-            let mut button = button(text(label).shaping(Shaping::Advanced))
+            let mut select_button = button(text(display_name).shaping(Shaping::Advanced))
                 .on_press(Message::SongSelected(entry.id));
             if is_selected {
-                button = button.style(iced::widget::button::success);
+                select_button = select_button.style(iced::widget::button::success);
+            } else {
+                select_button = select_button.style(iced::widget::button::secondary);
             }
-            list_column = list_column.push(button);
+
+            let current_rating = self.user_prefs.ratings.get(&entry.id).copied().unwrap_or(0);
+            let mut stars_row = row![];
+            for star in 1..=5u8 {
+                let symbol = if current_rating >= star { "★" } else { "☆" };
+                let target = if current_rating == star { 0 } else { star };
+                let star_button = button(text(symbol).shaping(Shaping::Advanced))
+                    .style(iced::widget::button::secondary)
+                    .on_press(Message::SetRating(entry.id, target));
+                stars_row = stars_row.push(star_button);
+            }
+            stars_row = stars_row.spacing(4);
+
+            let favorite_symbol = if self.user_prefs.favorites.contains(&entry.id) {
+                "♥"
+            } else {
+                "♡"
+            };
+            let favorite_button = button(text(favorite_symbol).shaping(Shaping::Advanced))
+                .style(iced::widget::button::secondary)
+                .on_press(Message::ToggleFavorite(entry.id));
+
+            let add_button = button(text("＋").shaping(Shaping::Advanced))
+                .style(iced::widget::button::secondary)
+                .on_press(Message::PlaylistDraftAdd(entry.id));
+
+            let entry_row =
+                row![select_button, stars_row, favorite_button, add_button,].spacing(12);
+
+            list_column = list_column.push(entry_row);
         }
 
-        let scroll = scrollable(list_column).height(Length::Fill);
+        if !has_entries {
+            list_column = list_column
+                .push(text("No MIDI files match the current filters").shaping(Shaping::Advanced));
+        }
 
-        column![search, scroll]
+        let list_scroll = scrollable(list_column).height(Length::Fill);
+
+        let body: Element<'_, Message> = if matches!(self.view_mode, LibraryView::Tree) {
+            let tree_scroll = scrollable(self.tree_panel()).height(Length::Fill);
+            row![
+                container(tree_scroll)
+                    .width(Length::Fixed(260.0))
+                    .height(Length::Fill),
+                container(list_scroll)
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            ]
+            .spacing(16)
+            .into()
+        } else {
+            container(list_scroll).width(Length::Fill).into()
+        };
+
+        column![search, body]
             .spacing(12)
             .height(Length::Fill)
             .into()
@@ -471,6 +929,161 @@ impl MidiPianoApp {
         }
 
         column![].into()
+    }
+
+    fn tree_panel(&self) -> Column<'_, Message> {
+        let mut column = Column::new().spacing(4);
+
+        let mut root_button = button(text("All Assets").shaping(Shaping::Advanced));
+        if self
+            .selected_folder
+            .as_deref()
+            .map_or(true, |id| id == "root")
+        {
+            root_button = root_button.style(iced::widget::button::success);
+        } else {
+            root_button = root_button.style(iced::widget::button::secondary);
+        }
+        column = column.push(root_button.on_press(Message::SelectFolder("root".into())));
+
+        let mut items: Vec<Element<'_, Message>> = Vec::new();
+        for child in self.library_tree.children.values() {
+            self.collect_tree_items(child, 1, &mut items);
+        }
+        for item in items {
+            column = column.push(item);
+        }
+
+        column
+    }
+
+    fn collect_tree_items<'a>(
+        &'a self,
+        node: &'a LibraryNode,
+        depth: usize,
+        items: &mut Vec<Element<'a, Message>>,
+    ) {
+        let has_children = !node.children.is_empty();
+        let is_expanded = self.expanded_folders.contains(&node.id);
+        let indicator = if has_children {
+            if is_expanded { "▼" } else { "▶" }
+        } else {
+            "•"
+        };
+        let indent = "  ".repeat(depth.saturating_sub(1));
+        let label = format!("{indent}{indicator} {}", node.name);
+        let mut button = button(text(label).shaping(Shaping::Advanced));
+        if has_children {
+            button = button.on_press(Message::ToggleFolder(node.id.clone()));
+        } else {
+            button = button.on_press(Message::SelectFolder(node.id.clone()));
+        }
+        if self.selected_folder.as_deref() == Some(&node.id) {
+            button = button.style(iced::widget::button::success);
+        } else {
+            button = button.style(iced::widget::button::secondary);
+        }
+        items.push(button.into());
+
+        if has_children && is_expanded {
+            for child in node.children.values() {
+                self.collect_tree_items(child, depth + 1, items);
+            }
+        }
+    }
+
+    fn playlist_editor(&self) -> Element<'_, Message> {
+        let name_input = text_input("Playlist name", &self.playlist_draft.name)
+            .on_input(Message::PlaylistDraftNameChanged)
+            .padding(8);
+
+        let save_button = button("Save Playlist")
+            .on_press(Message::PlaylistDraftSave)
+            .style(iced::widget::button::primary);
+
+        let clear_button = button("Clear Draft")
+            .on_press(Message::PlaylistDraftClear)
+            .style(iced::widget::button::secondary);
+
+        let random_button = button("Random 50")
+            .on_press(Message::GenerateRandomPlaylist)
+            .style(iced::widget::button::secondary);
+
+        let controls = row![name_input, save_button, clear_button, random_button].spacing(12);
+
+        let playlist_choices: Vec<PlaylistChoice> = self
+            .user_prefs
+            .playlists
+            .iter()
+            .map(PlaylistChoice::from)
+            .collect();
+
+        let selected_choice = self.selected_playlist.and_then(|id| {
+            playlist_choices
+                .iter()
+                .find(|choice| choice.id == id)
+                .cloned()
+        });
+
+        let playlist_pick = pick_list(
+            playlist_choices.clone(),
+            selected_choice,
+            |choice: PlaylistChoice| Message::PlaylistSelect(Some(choice.id)),
+        )
+        .placeholder("Choose playlist");
+
+        let load_button = if let Some(id) = self.selected_playlist {
+            button("Load into Draft")
+                .on_press(Message::PlaylistLoadToDraft(id))
+                .style(iced::widget::button::secondary)
+        } else {
+            button("Load into Draft").style(iced::widget::button::secondary)
+        };
+
+        let delete_button = if let Some(id) = self.selected_playlist {
+            button("Delete Playlist")
+                .on_press(Message::PlaylistDelete(id))
+                .style(iced::widget::button::danger)
+        } else {
+            button("Delete Playlist").style(iced::widget::button::danger)
+        };
+
+        let clear_selection_button = if self.selected_playlist.is_some() {
+            button("Clear Selection")
+                .on_press(Message::PlaylistSelect(None))
+                .style(iced::widget::button::secondary)
+        } else {
+            button("Clear Selection").style(iced::widget::button::secondary)
+        };
+
+        let selection_row = row![
+            playlist_pick,
+            load_button,
+            delete_button,
+            clear_selection_button,
+        ]
+        .spacing(12);
+
+        let mut tracks_column = Column::new().spacing(4);
+        for (index, track_id) in self.playlist_draft.tracks.iter().cloned().enumerate() {
+            if let Some(entry) = self.library.get(&track_id) {
+                let label = text(entry.name.clone()).shaping(Shaping::Advanced);
+                let remove_button = button("Remove")
+                    .on_press(Message::PlaylistDraftRemove(index))
+                    .style(iced::widget::button::secondary);
+                tracks_column = tracks_column.push(row![label, remove_button].spacing(12));
+            }
+        }
+        if self.playlist_draft.tracks.is_empty() {
+            tracks_column =
+                tracks_column.push(text("Playlist draft is empty").shaping(Shaping::Advanced));
+        }
+
+        let track_list = scrollable(tracks_column).height(Length::Fixed(200.0));
+
+        column![controls, selection_row, track_list]
+            .spacing(12)
+            .into()
     }
 }
 
@@ -522,6 +1135,36 @@ async fn refresh_devices(
 ) -> AsyncResult<Vec<MidiDeviceDescriptor>> {
     let mut guard = manager.lock().await;
     guard.refresh().await.map_err(|err| format!("{err:?}"))
+}
+
+async fn load_user_preferences() -> AsyncResult<UserPreferences> {
+    tokio::task::spawn_blocking(|| {
+        let path = std::path::Path::new(USER_DATA_FILE);
+        if !path.exists() {
+            return Ok(UserPreferences::default());
+        }
+        let data = std::fs::read_to_string(path)
+            .map_err(|err| format!("failed to read preferences: {err}"))?;
+        serde_json::from_str(&data).map_err(|err| format!("failed to parse preferences: {err}"))
+    })
+    .await
+    .map_err(|err| format!("failed to join preferences task: {err:?}"))?
+}
+
+async fn save_user_preferences(prefs: UserPreferences) -> AsyncResult<()> {
+    tokio::task::spawn_blocking(move || {
+        let path = std::path::Path::new(USER_DATA_FILE);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create data directory: {err}"))?;
+        }
+        let serialized = serde_json::to_string_pretty(&prefs)
+            .map_err(|err| format!("failed to serialize preferences: {err}"))?;
+        std::fs::write(path, serialized)
+            .map_err(|err| format!("failed to write preferences: {err}"))
+    })
+    .await
+    .map_err(|err| format!("failed to join save task: {err:?}"))?
 }
 
 async fn prepare_playback(
