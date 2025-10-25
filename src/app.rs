@@ -745,6 +745,7 @@ impl MidiPianoApp {
     }
 
     fn apply_tree_data(&mut self, tree: LibraryNode, folders: HashMap<String, Vec<Uuid>>) {
+        self.tree_loading = false;
         self.library_tree = tree;
         self.folder_entries = folders;
         if self

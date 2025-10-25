@@ -77,8 +77,11 @@ impl MidiPlayer {
             let start = TokioInstant::now();
             let mut last_reported = Duration::ZERO;
 
-            for event in &sequence.events {
-                let target = start + event.at;
+            let mut index = 0;
+            let total_events = sequence.events.len();
+            while index < total_events {
+                let event_at = sequence.events[index].at;
+                let target = start + event_at;
                 let wait_result = tokio::select! {
                     _ = time::sleep_until(target) => WaitOutcome::Completed,
                     _ = cancel_clone.notified() => WaitOutcome::Cancelled,
@@ -88,16 +91,21 @@ impl MidiPlayer {
                     return;
                 }
 
-                if let Err(err) = sink.send(&event.data).await {
+                let mut batch: Vec<Vec<u8>> = Vec::new();
+                while index < total_events && sequence.events[index].at == event_at {
+                    batch.push(sequence.events[index].data.clone());
+                    index += 1;
+                }
+
+                if let Err(err) = sink.send_batch(&batch).await {
                     let _ = sender.send(PlayerEvent::Error(err.to_string()));
                     return;
                 }
 
-                let elapsed = event.at;
-                if elapsed >= last_reported + PROGRESS_UPDATE_STEP || elapsed >= total_duration {
-                    last_reported = elapsed;
+                if event_at >= last_reported + PROGRESS_UPDATE_STEP || event_at >= total_duration {
+                    last_reported = event_at;
                     let _ = sender.send(PlayerEvent::Progress {
-                        elapsed,
+                        elapsed: event_at,
                         total: total_duration,
                     });
                 }

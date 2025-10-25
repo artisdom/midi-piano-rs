@@ -257,10 +257,17 @@ struct MidirSink {
 #[async_trait::async_trait]
 impl MidiSink for MidirSink {
     async fn send(&self, data: &[u8]) -> Result<()> {
+        self.send_batch(&[data.to_vec()]).await
+    }
+
+    async fn send_batch(&self, messages: &[Vec<u8>]) -> Result<()> {
         let mut connection = self.connection.lock().await;
-        connection
-            .send(data)
-            .map_err(|err| anyhow!("failed to send MIDI message: {err}"))
+        for message in messages {
+            connection
+                .send(message)
+                .map_err(|err| anyhow!("failed to send MIDI message: {err}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -271,24 +278,87 @@ struct BleMidiSink {
     write_lock: Mutex<()>,
 }
 
+const BLE_MTU: usize = 500;
+
 #[async_trait::async_trait]
 impl MidiSink for BleMidiSink {
     async fn send(&self, data: &[u8]) -> Result<()> {
-        let packet = pack_ble_midi_message(data);
+        let single = vec![data.to_vec()];
+        self.send_batch(&single).await
+    }
+
+    async fn send_batch(&self, messages: &[Vec<u8>]) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        let packets = pack_ble_midi_packets(messages);
         let _guard = self.write_lock.lock().await;
-        self.peripheral
-            .write(&self.characteristic, &packet, self.write_type)
-            .await
-            .map_err(|err| anyhow!("failed to send BLE MIDI data: {err}"))
+        for packet in packets {
+            self.peripheral
+                .write(&self.characteristic, &packet, self.write_type)
+                .await
+                .map_err(|err| anyhow!("failed to send BLE MIDI data: {err}"))?;
+        }
+        Ok(())
     }
 }
 
-fn pack_ble_midi_message(data: &[u8]) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(data.len() + 2);
-    packet.push(0x80); // packet header (timestamp-high, 0ms)
-    packet.push(0x80); // event timestamp (delta 0)
-    packet.extend_from_slice(data);
-    packet
+fn pack_ble_midi_packets(messages: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    const HEADER: u8 = 0x80;
+    if messages.is_empty() {
+        return Vec::new();
+    }
+
+    let mut packets = Vec::new();
+    let mut packet = Vec::with_capacity(BLE_MTU);
+    packet.push(HEADER);
+    let mut remaining = BLE_MTU - 1;
+
+    for message in messages {
+        if message.is_empty() {
+            continue;
+        }
+
+        let mut offset = 0;
+        while offset < message.len() {
+            if remaining <= 1 {
+                let mut finished = Vec::new();
+                std::mem::swap(&mut finished, &mut packet);
+                packets.push(finished);
+                packet.push(HEADER);
+                remaining = BLE_MTU - 1;
+                continue;
+            }
+
+            let available = remaining - 1;
+            let chunk_len = (message.len() - offset).min(available);
+            packet.push(HEADER);
+            packet.extend_from_slice(&message[offset..offset + chunk_len]);
+            offset += chunk_len;
+            remaining -= 1 + chunk_len;
+
+            if offset < message.len() {
+                let mut finished = Vec::new();
+                std::mem::swap(&mut finished, &mut packet);
+                packets.push(finished);
+                packet.push(HEADER);
+                remaining = BLE_MTU - 1;
+            } else if remaining <= 1 {
+                let mut finished = Vec::new();
+                std::mem::swap(&mut finished, &mut packet);
+                packets.push(finished);
+                packet.push(HEADER);
+                remaining = BLE_MTU - 1;
+            }
+        }
+    }
+
+    if packet.len() > 1 {
+        packets.push(packet);
+    }
+
+    packets
 }
 
 async fn is_midi_candidate(peripheral: &Peripheral) -> bool {

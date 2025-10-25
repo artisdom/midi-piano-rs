@@ -29,6 +29,13 @@ impl MidiSinkInfo {
 #[async_trait]
 pub trait MidiSink: Send + Sync {
     async fn send(&self, data: &[u8]) -> Result<()>;
+
+    async fn send_batch(&self, messages: &[Vec<u8>]) -> Result<()> {
+        for message in messages {
+            self.send(message).await?;
+        }
+        Ok(())
+    }
 }
 
 pub type SharedMidiSink = Arc<dyn MidiSink>;
