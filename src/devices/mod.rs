@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -96,6 +96,39 @@ impl MidiDeviceManager {
 
         descriptors.sort_by(|a, b| a.info.name.cmp(&b.info.name));
         Ok(descriptors)
+    }
+
+    pub async fn scan_ble_once(&mut self) -> Result<Vec<MidiDeviceDescriptor>> {
+        if self.bt_manager.is_none() {
+            match BtleManager::new().await {
+                Ok(manager) => self.bt_manager = Some(manager),
+                Err(err) => {
+                    return Err(anyhow!("BLE manager not available: {err}"));
+                }
+            }
+        }
+
+        let manager = match &self.bt_manager {
+            Some(manager) => manager,
+            None => return Ok(Vec::new()),
+        };
+
+        let descriptors = self.enumerate_ble_devices(manager).await?;
+        let mut new_devices = Vec::new();
+        for descriptor in descriptors {
+            match self.devices.entry(descriptor.info.id) {
+                Entry::Vacant(entry) => {
+                    entry.insert(descriptor.clone());
+                    new_devices.push(descriptor);
+                }
+                Entry::Occupied(mut entry) => {
+                    entry.insert(descriptor);
+                }
+            }
+        }
+
+        new_devices.sort_by(|a, b| a.info.name.cmp(&b.info.name));
+        Ok(new_devices)
     }
 
     pub async fn connect(&self, id: &Uuid) -> Result<SharedMidiSink> {

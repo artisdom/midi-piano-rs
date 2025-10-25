@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::stream;
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{
     Column, button, column, container, pick_list, row, scrollable, text, text::Shaping, text_input,
@@ -36,6 +37,7 @@ const USER_DATA_FILE: &str = "data/user_preferences.json";
 enum Message {
     LibraryLoaded(AsyncResult<MidiLibrary>),
     DevicesRefreshed(AsyncResult<Vec<MidiDeviceDescriptor>>),
+    BleScanUpdate(AsyncResult<Vec<MidiDeviceDescriptor>>),
     UserDataLoaded(AsyncResult<UserPreferences>),
     PreferencesSaved(AsyncResult<()>),
     TreeDataLoaded {
@@ -285,8 +287,12 @@ impl MidiPianoApp {
 
         let task = Task::batch([
             Task::perform(load_library(), Message::LibraryLoaded),
-            Task::perform(refresh_devices(device_manager), Message::DevicesRefreshed),
+            Task::perform(
+                refresh_devices(device_manager.clone()),
+                Message::DevicesRefreshed,
+            ),
             Task::perform(load_user_preferences(), Message::UserDataLoaded),
+            Self::ble_scan_task(device_manager.clone()),
         ]);
 
         (app, task)
@@ -317,10 +323,41 @@ impl MidiPianoApp {
                                 self.selected_device = None;
                             }
                         }
+                        self.devices.sort_by(|a, b| a.name.cmp(&b.name));
                         self.status_message = Some("Devices updated".into());
                     }
                     Err(err) => {
                         self.error_message = Some(format!("Failed to refresh devices: {err}"));
+                    }
+                }
+                Task::none()
+            }
+            Message::BleScanUpdate(result) => {
+                match result {
+                    Ok(new_devices) => {
+                        if !new_devices.is_empty() {
+                            let mut added_names = Vec::new();
+                            for descriptor in new_devices {
+                                if let Some(existing) = self
+                                    .devices
+                                    .iter_mut()
+                                    .find(|choice| choice.id == descriptor.info.id)
+                                {
+                                    existing.name = descriptor.info.name.clone();
+                                } else {
+                                    self.devices.push(DeviceChoice::from(&descriptor));
+                                    added_names.push(descriptor.info.name.clone());
+                                }
+                            }
+                            if !added_names.is_empty() {
+                                self.devices.sort_by(|a, b| a.name.cmp(&b.name));
+                                self.status_message =
+                                    Some(format!("New BLE devices: {}", added_names.join(", ")));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        self.error_message = Some(format!("BLE scan failed: {err}"));
                     }
                 }
                 Task::none()
@@ -756,6 +793,20 @@ impl MidiPianoApp {
             self.selected_folder = Some("root".into());
         }
         self.refresh_tree_cache();
+    }
+
+    fn ble_scan_task(manager: Arc<Mutex<MidiDeviceManager>>) -> Task<Message> {
+        Task::run(
+            stream::unfold(manager, |manager| async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let result = {
+                    let mut guard = manager.lock().await;
+                    guard.scan_ble_once().await.map_err(|err| err.to_string())
+                };
+                Some((Message::BleScanUpdate(result), manager))
+            }),
+            |message| message,
+        )
     }
 
     fn refresh_tree_cache(&mut self) {
