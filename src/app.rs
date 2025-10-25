@@ -48,7 +48,7 @@ enum Message {
     RefreshDevices,
     SetRating(Uuid, u8),
     ToggleFavorite(Uuid),
-    ToggleLibraryView(LibraryView),
+    SwitchTab(LibraryTab),
     ToggleFolder(String),
     SelectFolder(String),
     PlaylistDraftAdd(Uuid),
@@ -65,7 +65,6 @@ enum Message {
     PlaylistDelete(Uuid),
     PlaylistLoadToDraft(Uuid),
     GenerateRandomPlaylist,
-    ToggleFavoritesOnly(bool),
     Tick,
     DismissStatus,
 }
@@ -186,9 +185,19 @@ impl LibraryNode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LibraryView {
-    Flat,
+enum LibraryTab {
+    List,
     Tree,
+    Favorites,
+}
+
+#[derive(Debug, Clone)]
+struct TreeItem {
+    id: String,
+    name: String,
+    depth: usize,
+    has_children: bool,
+    is_expanded: bool,
 }
 
 pub struct MidiPianoApp {
@@ -208,14 +217,14 @@ pub struct MidiPianoApp {
     is_scanning_devices: bool,
     is_preparing_playback: bool,
     user_prefs: UserPreferences,
-    view_mode: LibraryView,
+    active_tab: LibraryTab,
     library_tree: LibraryNode,
     folder_entries: HashMap<String, Vec<Uuid>>,
     expanded_folders: HashSet<String>,
     selected_folder: Option<String>,
     playlist_draft: PlaylistDraft,
     selected_playlist: Option<Uuid>,
-    show_favorites_only: bool,
+    tree_cache: Vec<TreeItem>,
     play_queue: Option<PlayQueue>,
 }
 
@@ -243,16 +252,19 @@ impl MidiPianoApp {
             is_scanning_devices: true,
             is_preparing_playback: false,
             user_prefs: UserPreferences::default(),
-            view_mode: LibraryView::Flat,
+            active_tab: LibraryTab::List,
             library_tree: LibraryNode::new("root".into(), "Library".into()),
             folder_entries: HashMap::new(),
             expanded_folders,
             selected_folder: None,
             playlist_draft: PlaylistDraft::default(),
             selected_playlist: None,
-            show_favorites_only: false,
+            tree_cache: Vec::new(),
             play_queue: None,
         };
+
+        let mut app = app;
+        app.refresh_tree_cache();
 
         let task = Task::batch([
             Task::perform(load_library(), Message::LibraryLoaded),
@@ -338,12 +350,14 @@ impl MidiPianoApp {
                 self.search_query = query;
                 Task::none()
             }
-            Message::ToggleLibraryView(view) => {
-                if self.view_mode != view {
-                    self.view_mode = view;
-                    if matches!(self.view_mode, LibraryView::Tree) && self.selected_folder.is_none()
-                    {
-                        self.selected_folder = Some("root".into());
+            Message::SwitchTab(tab) => {
+                if self.active_tab != tab {
+                    self.active_tab = tab;
+                    if matches!(self.active_tab, LibraryTab::Tree) {
+                        if self.selected_folder.is_none() {
+                            self.selected_folder = Some("root".into());
+                        }
+                        self.refresh_tree_cache();
                     }
                 }
                 Task::none()
@@ -353,16 +367,13 @@ impl MidiPianoApp {
                 if !self.expanded_folders.remove(&folder_id) {
                     self.expanded_folders.insert(folder_id);
                 }
+                self.refresh_tree_cache();
                 Task::none()
             }
             Message::SelectFolder(folder_id) => {
                 if self.folder_entries.contains_key(&folder_id) {
                     self.selected_folder = Some(folder_id);
                 }
-                Task::none()
-            }
-            Message::ToggleFavoritesOnly(flag) => {
-                self.show_favorites_only = flag;
                 Task::none()
             }
             Message::SetRating(id, rating) => {
@@ -605,7 +616,7 @@ impl MidiPianoApp {
         let content = column![
             self.device_section(),
             self.playback_controls(),
-            self.library_controls(),
+            self.library_tabs(),
             self.library_view(),
             self.playlist_editor(),
             self.status_banner()
@@ -696,14 +707,32 @@ impl MidiPianoApp {
                         node = node.ensure_child(node_id.clone(), segment.clone());
                         folder_entries
                             .entry(node_id.clone())
-                            .or_insert_with(Vec::new);
-                    }
-                    let leaf_id = format!("asset:{}", segments.join("/"));
-                    if let Some(entries) = folder_entries.get_mut(&leaf_id) {
-                        entries.push(entry.id);
+                            .or_insert_with(Vec::new)
+                            .push(entry.id);
                     }
                 }
             }
+        }
+
+        // Collect local entries and add a "Local" node for tree view.
+        let local_entries: Vec<Uuid> = self
+            .library
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry.origin, crate::midi::MidiOrigin::Local))
+            .map(|entry| entry.id)
+            .collect();
+        if !local_entries.is_empty() {
+            folder_entries
+                .entry("root".into())
+                .or_insert_with(Vec::new)
+                .extend(local_entries.iter().copied());
+            let local_id = "local".to_string();
+            root.ensure_child(local_id.clone(), "Local".into());
+            folder_entries
+                .entry(local_id)
+                .or_insert_with(Vec::new)
+                .extend(local_entries);
         }
 
         self.library_tree = root;
@@ -713,6 +742,7 @@ impl MidiPianoApp {
                 self.selected_folder = None;
             }
         }
+        self.refresh_tree_cache();
     }
 
     fn save_preferences_task(&self) -> Task<Message> {
@@ -722,12 +752,18 @@ impl MidiPianoApp {
         )
     }
 
+    fn refresh_tree_cache(&mut self) {
+        let mut items = Vec::new();
+        collect_tree_items(&self.library_tree, 0, &self.expanded_folders, &mut items);
+        self.tree_cache = items;
+    }
+
     fn visible_entries(&self) -> Vec<&crate::midi::MidiEntry> {
         let query = self.search_query.trim().to_lowercase();
 
-        let mut base: Vec<&crate::midi::MidiEntry> = match self.view_mode {
-            LibraryView::Flat => self.library.entries().iter().collect(),
-            LibraryView::Tree => {
+        let mut base: Vec<&crate::midi::MidiEntry> = match self.active_tab {
+            LibraryTab::List => self.library.entries().iter().collect(),
+            LibraryTab::Tree => {
                 let folder_id = self.selected_folder.as_deref().unwrap_or("root");
                 self.folder_entries
                     .get(folder_id)
@@ -736,11 +772,13 @@ impl MidiPianoApp {
                     .filter_map(|id| self.library.get(id))
                     .collect()
             }
+            LibraryTab::Favorites => self
+                .user_prefs
+                .favorites
+                .iter()
+                .filter_map(|id| self.library.get(id))
+                .collect(),
         };
-
-        if self.show_favorites_only {
-            base.retain(|entry| self.user_prefs.favorites.contains(&entry.id));
-        }
 
         if !query.is_empty() {
             base.retain(|entry| entry.name.to_lowercase().contains(&query));
@@ -996,59 +1034,34 @@ impl MidiPianoApp {
         .into()
     }
 
-    fn library_controls(&self) -> Element<'_, Message> {
-        let list_button = {
-            let mut button = button("List");
-            if matches!(self.view_mode, LibraryView::Flat) {
-                button = button.style(iced::widget::button::success);
-            } else {
-                button = button.style(iced::widget::button::secondary);
-            }
-            button.on_press(Message::ToggleLibraryView(LibraryView::Flat))
-        };
+    fn library_tabs(&self) -> Element<'_, Message> {
+        let mut list_button = button(text("List").shaping(Shaping::Advanced));
+        if self.active_tab == LibraryTab::List {
+            list_button = list_button.style(iced::widget::button::primary);
+        } else {
+            list_button = list_button.style(iced::widget::button::secondary);
+        }
+        let list_button = list_button.on_press(Message::SwitchTab(LibraryTab::List));
 
-        let tree_button = {
-            let mut button = button("Tree");
-            if matches!(self.view_mode, LibraryView::Tree) {
-                button = button.style(iced::widget::button::success);
-            } else {
-                button = button.style(iced::widget::button::secondary);
-            }
-            button.on_press(Message::ToggleLibraryView(LibraryView::Tree))
-        };
+        let mut tree_button = button(text("Tree").shaping(Shaping::Advanced));
+        if self.active_tab == LibraryTab::Tree {
+            tree_button = tree_button.style(iced::widget::button::primary);
+        } else {
+            tree_button = tree_button.style(iced::widget::button::secondary);
+        }
+        let tree_button = tree_button.on_press(Message::SwitchTab(LibraryTab::Tree));
 
-        let favorites_button = {
-            let label = if self.show_favorites_only {
-                "Favorites ✔"
-            } else {
-                "Favorites"
-            };
-            let mut button = button(text(label).shaping(Shaping::Advanced));
-            if self.show_favorites_only {
-                button = button.style(iced::widget::button::success);
-            } else {
-                button = button.style(iced::widget::button::secondary);
-            }
-            button.on_press(Message::ToggleFavoritesOnly(!self.show_favorites_only))
-        };
+        let mut favorites_button = button(text("Favorites").shaping(Shaping::Advanced));
+        if self.active_tab == LibraryTab::Favorites {
+            favorites_button = favorites_button.style(iced::widget::button::primary);
+        } else {
+            favorites_button = favorites_button.style(iced::widget::button::secondary);
+        }
+        let favorites_button = favorites_button.on_press(Message::SwitchTab(LibraryTab::Favorites));
 
-        let favorites_play_seq = button("Play Favorites")
-            .on_press(Message::PlayFavorites { shuffle: false })
-            .style(iced::widget::button::primary);
-
-        let favorites_play_shuffle = button("Shuffle Favorites")
-            .on_press(Message::PlayFavorites { shuffle: true })
-            .style(iced::widget::button::secondary);
-
-        row![
-            list_button,
-            tree_button,
-            favorites_button,
-            favorites_play_seq,
-            favorites_play_shuffle
-        ]
-        .spacing(12)
-        .into()
+        row![list_button, tree_button, favorites_button]
+            .spacing(12)
+            .into()
     }
 
     fn playback_controls(&self) -> Element<'_, Message> {
@@ -1116,93 +1129,116 @@ impl MidiPianoApp {
             .on_input(Message::SearchChanged)
             .padding(8);
 
-        let mut list_column = Column::new().spacing(6);
-        let mut has_entries = false;
+        let entries = self.visible_entries();
+        let list = scrollable(self.entry_column(entries)).height(Length::Fill);
 
-        for entry in self.visible_entries() {
-            has_entries = true;
-            let is_selected = Some(entry.id) == self.selected_song;
-            let display_name = if matches!(entry.origin, crate::midi::MidiOrigin::Local) {
-                format!("{} (Local)", entry.name)
-            } else {
-                entry.name.clone()
-            };
-            let mut select_button = button(text(display_name).shaping(Shaping::Advanced))
-                .on_press(Message::SongSelected(entry.id));
-            if is_selected {
-                select_button = select_button.style(iced::widget::button::success);
-            } else {
-                select_button = select_button.style(iced::widget::button::secondary);
+        match self.active_tab {
+            LibraryTab::List => column![search, list]
+                .spacing(12)
+                .height(Length::Fill)
+                .into(),
+            LibraryTab::Tree => {
+                let tree = scrollable(self.tree_panel()).height(Length::Fill);
+                column![
+                    search,
+                    row![
+                        container(tree)
+                            .width(Length::Fixed(260.0))
+                            .height(Length::Fill),
+                        container(list).width(Length::Fill).height(Length::Fill),
+                    ]
+                    .spacing(16)
+                ]
+                .spacing(12)
+                .height(Length::Fill)
+                .into()
             }
+            LibraryTab::Favorites => {
+                let play_row = row![
+                    button("Play Favorites")
+                        .on_press(Message::PlayFavorites { shuffle: false })
+                        .style(iced::widget::button::primary),
+                    button("Shuffle Favorites")
+                        .on_press(Message::PlayFavorites { shuffle: true })
+                        .style(iced::widget::button::secondary)
+                ]
+                .spacing(12);
 
-            let play_button = button(text("▶").shaping(Shaping::Advanced))
-                .style(iced::widget::button::primary)
-                .on_press(Message::StartPlayback(entry.id));
-
-            let current_rating = self.user_prefs.ratings.get(&entry.id).copied().unwrap_or(0);
-            let mut stars_row = row![];
-            for star in 1..=5u8 {
-                let symbol = if current_rating >= star { "★" } else { "☆" };
-                let target = if current_rating == star { 0 } else { star };
-                let star_button = button(text(symbol).shaping(Shaping::Advanced))
-                    .style(iced::widget::button::secondary)
-                    .on_press(Message::SetRating(entry.id, target));
-                stars_row = stars_row.push(star_button);
+                column![search, play_row, list]
+                    .spacing(12)
+                    .height(Length::Fill)
+                    .into()
             }
-            stars_row = stars_row.spacing(4);
-
-            let favorite_symbol = if self.user_prefs.favorites.contains(&entry.id) {
-                "♥"
-            } else {
-                "♡"
-            };
-            let favorite_button = button(text(favorite_symbol).shaping(Shaping::Advanced))
-                .style(iced::widget::button::secondary)
-                .on_press(Message::ToggleFavorite(entry.id));
-
-            let add_button = button(text("＋").shaping(Shaping::Advanced))
-                .style(iced::widget::button::secondary)
-                .on_press(Message::PlaylistDraftAdd(entry.id));
-
-            let entry_row = row![
-                select_button,
-                play_button,
-                stars_row,
-                favorite_button,
-                add_button,
-            ]
-            .spacing(12);
-
-            list_column = list_column.push(entry_row);
         }
+    }
 
-        if !has_entries {
-            list_column = list_column
+    fn entry_column<'a>(&'a self, entries: Vec<&'a crate::midi::MidiEntry>) -> Column<'a, Message> {
+        let mut column = Column::new().spacing(6);
+        if entries.is_empty() {
+            column = column
                 .push(text("No MIDI files match the current filters").shaping(Shaping::Advanced));
-        }
-
-        let list_scroll = scrollable(list_column).height(Length::Fill);
-
-        let body: Element<'_, Message> = if matches!(self.view_mode, LibraryView::Tree) {
-            let tree_scroll = scrollable(self.tree_panel()).height(Length::Fill);
-            row![
-                container(tree_scroll)
-                    .width(Length::Fixed(260.0))
-                    .height(Length::Fill),
-                container(list_scroll)
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-            ]
-            .spacing(16)
-            .into()
         } else {
-            container(list_scroll).width(Length::Fill).into()
+            for entry in entries {
+                column = column.push(self.entry_row(entry));
+            }
+        }
+        column
+    }
+
+    fn entry_row(&self, entry: &crate::midi::MidiEntry) -> Element<'_, Message> {
+        let is_selected = Some(entry.id) == self.selected_song;
+        let display_name = if matches!(entry.origin, crate::midi::MidiOrigin::Local) {
+            format!("{} (Local)", entry.name)
+        } else {
+            entry.name.clone()
         };
 
-        column![search, body]
-            .spacing(12)
-            .height(Length::Fill)
-            .into()
+        let mut select_button = button(text(display_name).shaping(Shaping::Advanced))
+            .on_press(Message::SongSelected(entry.id));
+        if is_selected {
+            select_button = select_button.style(iced::widget::button::success);
+        } else {
+            select_button = select_button.style(iced::widget::button::secondary);
+        }
+
+        let play_button = button(text("▶").shaping(Shaping::Advanced))
+            .style(iced::widget::button::primary)
+            .on_press(Message::StartPlayback(entry.id));
+
+        let current_rating = self.user_prefs.ratings.get(&entry.id).copied().unwrap_or(0);
+        let mut stars_row = row![];
+        for star in 1..=5u8 {
+            let symbol = if current_rating >= star { "★" } else { "☆" };
+            let target = if current_rating == star { 0 } else { star };
+            let star_button = button(text(symbol).shaping(Shaping::Advanced))
+                .style(iced::widget::button::secondary)
+                .on_press(Message::SetRating(entry.id, target));
+            stars_row = stars_row.push(star_button);
+        }
+        stars_row = stars_row.spacing(4);
+
+        let favorite_symbol = if self.user_prefs.favorites.contains(&entry.id) {
+            "♥"
+        } else {
+            "♡"
+        };
+        let favorite_button = button(text(favorite_symbol).shaping(Shaping::Advanced))
+            .style(iced::widget::button::secondary)
+            .on_press(Message::ToggleFavorite(entry.id));
+
+        let add_button = button(text("＋").shaping(Shaping::Advanced))
+            .style(iced::widget::button::secondary)
+            .on_press(Message::PlaylistDraftAdd(entry.id));
+
+        row![
+            select_button,
+            play_button,
+            stars_row,
+            favorite_button,
+            add_button,
+        ]
+        .spacing(12)
+        .into()
     }
 
     fn status_banner(&self) -> Element<'_, Message> {
@@ -1253,50 +1289,29 @@ impl MidiPianoApp {
         }
         column = column.push(root_button);
 
-        let mut items: Vec<Element<'_, Message>> = Vec::new();
-        for child in self.library_tree.children.values() {
-            self.collect_tree_items(child, 1, &mut items);
-        }
-        for item in items {
-            column = column.push(item);
+        for item in &self.tree_cache {
+            let indent = "  ".repeat(item.depth);
+            let indicator = if item.has_children {
+                if item.is_expanded { "▼" } else { "▶" }
+            } else {
+                "•"
+            };
+            let label = format!("{indent}{indicator} {}", item.name);
+            let mut button = button(text(label).shaping(Shaping::Advanced));
+            if item.has_children {
+                button = button.on_press(Message::ToggleFolder(item.id.clone()));
+            } else {
+                button = button.on_press(Message::SelectFolder(item.id.clone()));
+            }
+            if self.selected_folder.as_deref() == Some(item.id.as_str()) {
+                button = button.style(iced::widget::button::success);
+            } else {
+                button = button.style(iced::widget::button::secondary);
+            }
+            column = column.push(button);
         }
 
         column
-    }
-
-    fn collect_tree_items<'a>(
-        &'a self,
-        node: &'a LibraryNode,
-        depth: usize,
-        items: &mut Vec<Element<'a, Message>>,
-    ) {
-        let has_children = !node.children.is_empty();
-        let is_expanded = self.expanded_folders.contains(&node.id);
-        let indicator = if has_children {
-            if is_expanded { "▼" } else { "▶" }
-        } else {
-            "•"
-        };
-        let indent = "  ".repeat(depth.saturating_sub(1));
-        let label = format!("{indent}{indicator} {}", node.name);
-        let mut button = button(text(label).shaping(Shaping::Advanced));
-        if has_children {
-            button = button.on_press(Message::ToggleFolder(node.id.clone()));
-        } else {
-            button = button.on_press(Message::SelectFolder(node.id.clone()));
-        }
-        if self.selected_folder.as_deref() == Some(&node.id) {
-            button = button.style(iced::widget::button::success);
-        } else {
-            button = button.style(iced::widget::button::secondary);
-        }
-        items.push(button.into());
-
-        if has_children && is_expanded {
-            for child in node.children.values() {
-                self.collect_tree_items(child, depth + 1, items);
-            }
-        }
     }
 
     fn playlist_editor(&self) -> Element<'_, Message> {
@@ -1534,6 +1549,39 @@ fn subscription(state: &MidiPianoApp) -> Subscription<Message> {
 
 fn theme(state: &MidiPianoApp) -> Theme {
     state.theme()
+}
+
+fn collect_tree_items(
+    node: &LibraryNode,
+    depth: usize,
+    expanded: &HashSet<String>,
+    items: &mut Vec<TreeItem>,
+) {
+    for child in node.children.values() {
+        collect_tree_items_inner(child, depth, expanded, items);
+    }
+}
+
+fn collect_tree_items_inner(
+    node: &LibraryNode,
+    depth: usize,
+    expanded: &HashSet<String>,
+    items: &mut Vec<TreeItem>,
+) {
+    let has_children = !node.children.is_empty();
+    let is_expanded = expanded.contains(&node.id);
+    items.push(TreeItem {
+        id: node.id.clone(),
+        name: node.name.clone(),
+        depth,
+        has_children,
+        is_expanded,
+    });
+    if has_children && is_expanded {
+        for child in node.children.values() {
+            collect_tree_items_inner(child, depth + 1, expanded, items);
+        }
+    }
 }
 
 fn build_window_icon() -> Option<window::Icon> {
