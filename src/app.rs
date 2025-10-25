@@ -38,6 +38,15 @@ enum Message {
     DevicesRefreshed(AsyncResult<Vec<MidiDeviceDescriptor>>),
     UserDataLoaded(AsyncResult<UserPreferences>),
     PreferencesSaved(AsyncResult<()>),
+    TreeDataLoaded {
+        request_id: u64,
+        tree: LibraryNode,
+        folders: HashMap<String, Vec<Uuid>>,
+    },
+    TreeDataFailed {
+        request_id: u64,
+        error: String,
+    },
     DeviceSelected(Uuid),
     SongSelected(Uuid),
     SearchChanged(String),
@@ -57,8 +66,13 @@ enum Message {
     PlaylistDraftClear,
     PlaylistDraftSave,
     StartPlayback(Uuid),
-    PlayFavorites { shuffle: bool },
-    PlayPlaylist { id: Uuid, shuffle: bool },
+    PlayFavorites {
+        shuffle: bool,
+    },
+    PlayPlaylist {
+        id: Uuid,
+        shuffle: bool,
+    },
     NextTrack,
     PrevTrack,
     PlaylistSelect(Option<Uuid>),
@@ -224,6 +238,8 @@ pub struct MidiPianoApp {
     playlist_draft: PlaylistDraft,
     selected_playlist: Option<Uuid>,
     tree_cache: Vec<TreeItem>,
+    tree_loading: bool,
+    tree_request_id: u64,
     play_queue: Option<PlayQueue>,
 }
 
@@ -259,6 +275,8 @@ impl MidiPianoApp {
             playlist_draft: PlaylistDraft::default(),
             selected_playlist: None,
             tree_cache: Vec::new(),
+            tree_loading: false,
+            tree_request_id: 0,
             play_queue: None,
         };
 
@@ -280,8 +298,8 @@ impl MidiPianoApp {
                 match result {
                     Ok(library) => {
                         self.library = library;
-                        self.rebuild_library_tree();
                         self.status_message = Some("Library loaded".into());
+                        return self.schedule_tree_rebuild();
                     }
                     Err(err) => {
                         self.error_message = Some(format!("Failed to load MIDI library: {err}"));
@@ -330,6 +348,24 @@ impl MidiPianoApp {
                 }
                 Task::none()
             }
+            Message::TreeDataLoaded {
+                request_id,
+                tree,
+                folders,
+            } => {
+                if request_id == self.tree_request_id {
+                    self.tree_loading = false;
+                    self.apply_tree_data(tree, folders);
+                }
+                Task::none()
+            }
+            Message::TreeDataFailed { request_id, error } => {
+                if request_id == self.tree_request_id {
+                    self.tree_loading = false;
+                    self.error_message = Some(format!("Failed to update library tree: {error}"));
+                }
+                Task::none()
+            }
             Message::RefreshDevices => {
                 self.is_scanning_devices = true;
                 Task::perform(
@@ -356,7 +392,9 @@ impl MidiPianoApp {
                         if self.selected_folder.is_none() {
                             self.selected_folder = Some("root".into());
                         }
-                        self.refresh_tree_cache();
+                        if self.tree_cache.is_empty() && !self.tree_loading {
+                            return self.schedule_tree_rebuild();
+                        }
                     }
                 }
                 Task::none()
@@ -581,7 +619,7 @@ impl MidiPianoApp {
                         Ok(entry) => {
                             self.selected_song = Some(entry.id);
                             self.status_message = Some(format!("Added {}", entry.name));
-                            self.rebuild_library_tree();
+                            return self.schedule_tree_rebuild();
                         }
                         Err(err) => {
                             self.error_message = Some(format!("Failed to add MIDI file: {err:?}"));
@@ -681,74 +719,44 @@ impl MidiPianoApp {
         }
     }
 
-    fn rebuild_library_tree(&mut self) {
-        let mut root = LibraryNode::new("root".into(), "Library".into());
-        let mut folder_entries: HashMap<String, Vec<Uuid>> = HashMap::new();
-        folder_entries.insert("root".into(), Vec::new());
-
-        for entry in self.library.entries() {
-            if matches!(entry.origin, crate::midi::MidiOrigin::Asset) {
-                folder_entries
-                    .entry("root".into())
-                    .or_insert_with(Vec::new)
-                    .push(entry.id);
-
-                if let Some(segments) = &entry.library_path {
-                    if segments.is_empty() {
-                        continue;
-                    }
-
-                    let mut node = &mut root;
-                    let mut path_builder: Vec<String> = Vec::new();
-                    for segment in segments {
-                        path_builder.push(segment.clone());
-                        let node_id = format!("asset:{}", path_builder.join("/"));
-                        node = node.ensure_child(node_id.clone(), segment.clone());
-                        folder_entries
-                            .entry(node_id.clone())
-                            .or_insert_with(Vec::new)
-                            .push(entry.id);
-                    }
-                }
-            }
-        }
-
-        // Collect local entries and add a "Local" node for tree view.
-        let local_entries: Vec<Uuid> = self
-            .library
-            .entries()
-            .iter()
-            .filter(|entry| matches!(entry.origin, crate::midi::MidiOrigin::Local))
-            .map(|entry| entry.id)
-            .collect();
-        if !local_entries.is_empty() {
-            folder_entries
-                .entry("root".into())
-                .or_insert_with(Vec::new)
-                .extend(local_entries.iter().copied());
-            let local_id = "local".to_string();
-            root.ensure_child(local_id.clone(), "Local".into());
-            folder_entries
-                .entry(local_id)
-                .or_insert_with(Vec::new)
-                .extend(local_entries);
-        }
-
-        self.library_tree = root;
-        self.folder_entries = folder_entries;
-        if let Some(selected) = self.selected_folder.clone() {
-            if !self.folder_entries.contains_key(&selected) {
-                self.selected_folder = None;
-            }
-        }
-        self.refresh_tree_cache();
-    }
-
     fn save_preferences_task(&self) -> Task<Message> {
         Task::perform(
             save_user_preferences(self.user_prefs.clone()),
             Message::PreferencesSaved,
         )
+    }
+
+    fn schedule_tree_rebuild(&mut self) -> Task<Message> {
+        self.tree_loading = true;
+        self.tree_cache.clear();
+        self.folder_entries.clear();
+        self.tree_request_id = self.tree_request_id.wrapping_add(1);
+        let request_id = self.tree_request_id;
+        let entries = self.library.entries().to_vec();
+        Task::perform(compute_tree_data(entries), move |result| match result {
+            Ok((tree, folders)) => Message::TreeDataLoaded {
+                request_id,
+                tree,
+                folders,
+            },
+            Err(err) => Message::TreeDataFailed {
+                request_id,
+                error: err,
+            },
+        })
+    }
+
+    fn apply_tree_data(&mut self, tree: LibraryNode, folders: HashMap<String, Vec<Uuid>>) {
+        self.library_tree = tree;
+        self.folder_entries = folders;
+        if self
+            .selected_folder
+            .as_ref()
+            .map_or(true, |id| !self.folder_entries.contains_key(id))
+        {
+            self.selected_folder = Some("root".into());
+        }
+        self.refresh_tree_cache();
     }
 
     fn refresh_tree_cache(&mut self) {
@@ -762,13 +770,17 @@ impl MidiPianoApp {
 
         let mut base: Vec<&crate::midi::MidiEntry> = match self.active_tab {
             LibraryTab::Tree => {
-                let folder_id = self.selected_folder.as_deref().unwrap_or("root");
-                self.folder_entries
-                    .get(folder_id)
-                    .into_iter()
-                    .flat_map(|ids| ids.iter())
-                    .filter_map(|id| self.library.get(id))
-                    .collect()
+                if self.tree_loading {
+                    Vec::new()
+                } else {
+                    let folder_id = self.selected_folder.as_deref().unwrap_or("root");
+                    self.folder_entries
+                        .get(folder_id)
+                        .into_iter()
+                        .flat_map(|ids| ids.iter())
+                        .filter_map(|id| self.library.get(id))
+                        .collect()
+                }
             }
             LibraryTab::Favorites => self
                 .user_prefs
@@ -1260,6 +1272,10 @@ impl MidiPianoApp {
     fn tree_panel(&self) -> Column<'_, Message> {
         let mut column = Column::new().spacing(4);
 
+        if self.tree_loading && self.tree_cache.is_empty() {
+            return column.push(text("Loading tree...").shaping(Shaping::Advanced));
+        }
+
         for item in &self.tree_cache {
             let indent = "  ".repeat(item.depth);
             let indicator = if item.has_children {
@@ -1585,4 +1601,75 @@ pub fn run() -> iced::Result {
         .default_font(DEFAULT_FONT)
         .executor::<executor::Default>()
         .run_with(MidiPianoApp::init)
+}
+
+async fn compute_tree_data(
+    entries: Vec<crate::midi::MidiEntry>,
+) -> AsyncResult<(LibraryNode, HashMap<String, Vec<Uuid>>)> {
+    tokio::task::spawn_blocking(move || build_tree_data_owned(entries))
+        .await
+        .map_err(|err| format!("tree rebuild task failed: {err:?}"))
+}
+
+fn build_tree_data_owned(
+    entries: Vec<crate::midi::MidiEntry>,
+) -> (LibraryNode, HashMap<String, Vec<Uuid>>) {
+    let mut root = LibraryNode::new("root".into(), "Library".into());
+    let mut folders: HashMap<String, Vec<Uuid>> = HashMap::new();
+    folders.insert("root".into(), Vec::new());
+
+    let mut local_ids: Vec<Uuid> = Vec::new();
+
+    for entry in entries {
+        match entry.origin {
+            crate::midi::MidiOrigin::Asset => {
+                folders
+                    .entry("root".into())
+                    .or_insert_with(Vec::new)
+                    .push(entry.id);
+
+                if let Some(segments) = entry.library_path.clone() {
+                    if segments.is_empty() {
+                        continue;
+                    }
+
+                    let mut node = &mut root;
+                    let mut path_builder = String::new();
+                    for (index, segment) in segments.iter().enumerate() {
+                        if index > 0 {
+                            path_builder.push('/');
+                        }
+                        path_builder.push_str(segment);
+                        let node_id = format!("asset:{}", path_builder);
+                        node = node.ensure_child(node_id.clone(), segment.clone());
+                        folders.entry(node_id.clone()).or_insert_with(Vec::new);
+                    }
+
+                    let leaf_id = format!("asset:{}", path_builder);
+                    folders
+                        .entry(leaf_id)
+                        .or_insert_with(Vec::new)
+                        .push(entry.id);
+                }
+            }
+            crate::midi::MidiOrigin::Local => {
+                local_ids.push(entry.id);
+            }
+        }
+    }
+
+    if !local_ids.is_empty() {
+        folders
+            .entry("root".into())
+            .or_insert_with(Vec::new)
+            .extend(local_ids.iter().copied());
+        let local_id = "local".to_string();
+        root.ensure_child(local_id.clone(), "Local".into());
+        folders
+            .entry(local_id)
+            .or_insert_with(Vec::new)
+            .extend(local_ids);
+    }
+
+    (root, folders)
 }
