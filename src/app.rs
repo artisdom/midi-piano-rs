@@ -728,8 +728,6 @@ impl MidiPianoApp {
 
     fn schedule_tree_rebuild(&mut self) -> Task<Message> {
         self.tree_loading = true;
-        self.tree_cache.clear();
-        self.folder_entries.clear();
         self.tree_request_id = self.tree_request_id.wrapping_add(1);
         let request_id = self.tree_request_id;
         let entries = self.library.entries().to_vec();
@@ -770,17 +768,13 @@ impl MidiPianoApp {
 
         let mut base: Vec<&crate::midi::MidiEntry> = match self.active_tab {
             LibraryTab::Tree => {
-                if self.tree_loading {
-                    Vec::new()
-                } else {
-                    let folder_id = self.selected_folder.as_deref().unwrap_or("root");
-                    self.folder_entries
-                        .get(folder_id)
-                        .into_iter()
-                        .flat_map(|ids| ids.iter())
-                        .filter_map(|id| self.library.get(id))
-                        .collect()
-                }
+                let folder_id = self.selected_folder.as_deref().unwrap_or("root");
+                self.folder_entries
+                    .get(folder_id)
+                    .into_iter()
+                    .flat_map(|ids| ids.iter())
+                    .filter_map(|id| self.library.get(id))
+                    .collect()
             }
             LibraryTab::Favorites => self
                 .user_prefs
