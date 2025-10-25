@@ -1276,19 +1276,6 @@ impl MidiPianoApp {
     fn tree_panel(&self) -> Column<'_, Message> {
         let mut column = Column::new().spacing(4);
 
-        let mut root_button = button(text("All Assets").shaping(Shaping::Advanced))
-            .on_press(Message::SelectFolder("root".into()));
-        if self
-            .selected_folder
-            .as_deref()
-            .map_or(true, |id| id == "root")
-        {
-            root_button = root_button.style(iced::widget::button::success);
-        } else {
-            root_button = root_button.style(iced::widget::button::secondary);
-        }
-        column = column.push(root_button);
-
         for item in &self.tree_cache {
             let indent = "  ".repeat(item.depth);
             let indicator = if item.has_children {
