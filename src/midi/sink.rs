@@ -30,7 +30,7 @@ impl MidiSinkInfo {
 pub trait MidiSink: Send + Sync {
     async fn send(&self, data: &[u8]) -> Result<()>;
 
-    async fn send_batch(&self, messages: &[Vec<u8>]) -> Result<()> {
+    async fn send_batch(&self, _timestamp_ms: u16, messages: &[Vec<u8>]) -> Result<()> {
         for message in messages {
             self.send(message).await?;
         }

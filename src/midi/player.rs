@@ -97,7 +97,9 @@ impl MidiPlayer {
                     index += 1;
                 }
 
-                if let Err(err) = sink.send_batch(&batch).await {
+                let timestamp_ms = ((event_at.as_micros() / 1000) % 0x2000) as u16;
+
+                if let Err(err) = sink.send_batch(timestamp_ms, &batch).await {
                     let _ = sender.send(PlayerEvent::Error(err.to_string()));
                     return;
                 }
