@@ -186,7 +186,6 @@ impl LibraryNode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LibraryTab {
-    List,
     Tree,
     Favorites,
 }
@@ -252,7 +251,7 @@ impl MidiPianoApp {
             is_scanning_devices: true,
             is_preparing_playback: false,
             user_prefs: UserPreferences::default(),
-            active_tab: LibraryTab::List,
+            active_tab: LibraryTab::Tree,
             library_tree: LibraryNode::new("root".into(), "Library".into()),
             folder_entries: HashMap::new(),
             expanded_folders,
@@ -762,7 +761,6 @@ impl MidiPianoApp {
         let query = self.search_query.trim().to_lowercase();
 
         let mut base: Vec<&crate::midi::MidiEntry> = match self.active_tab {
-            LibraryTab::List => self.library.entries().iter().collect(),
             LibraryTab::Tree => {
                 let folder_id = self.selected_folder.as_deref().unwrap_or("root");
                 self.folder_entries
@@ -1035,14 +1033,6 @@ impl MidiPianoApp {
     }
 
     fn library_tabs(&self) -> Element<'_, Message> {
-        let mut list_button = button(text("List").shaping(Shaping::Advanced));
-        if self.active_tab == LibraryTab::List {
-            list_button = list_button.style(iced::widget::button::primary);
-        } else {
-            list_button = list_button.style(iced::widget::button::secondary);
-        }
-        let list_button = list_button.on_press(Message::SwitchTab(LibraryTab::List));
-
         let mut tree_button = button(text("Tree").shaping(Shaping::Advanced));
         if self.active_tab == LibraryTab::Tree {
             tree_button = tree_button.style(iced::widget::button::primary);
@@ -1059,9 +1049,7 @@ impl MidiPianoApp {
         }
         let favorites_button = favorites_button.on_press(Message::SwitchTab(LibraryTab::Favorites));
 
-        row![list_button, tree_button, favorites_button]
-            .spacing(12)
-            .into()
+        row![tree_button, favorites_button].spacing(12).into()
     }
 
     fn playback_controls(&self) -> Element<'_, Message> {
@@ -1133,10 +1121,6 @@ impl MidiPianoApp {
         let list = scrollable(self.entry_column(entries)).height(Length::Fill);
 
         match self.active_tab {
-            LibraryTab::List => column![search, list]
-                .spacing(12)
-                .height(Length::Fill)
-                .into(),
             LibraryTab::Tree => {
                 let tree = scrollable(self.tree_panel()).height(Length::Fill);
                 column![
